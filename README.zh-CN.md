@@ -6,15 +6,18 @@
 
 ## 功能
 
-- 显示 DeepSeek 正文与可折叠的思考过程，使用 Obsidian 原生 Markdown 和公式渲染。
+- 使用 Obsidian 原生 Markdown 和公式渲染。
 - 多对话存档、上下文占用与缓存命中统计；可手动压缩上下文，接近 80 万 tokens 时也会自动压缩。
 - 选择、拖入或粘贴图片与 PDF。图片走 DeepSeek Flash 原生识图，PDF 走 MinerU。图片字节只用于当次识图请求，后续对话只携带识别文字。
 - 可选的 `@` 本地文献库引用，包括 arXiv 源码获取与 PDF 转 Markdown。
 - 可选的 Notebook 模式：启动本地 JupyterLab、在 Obsidian 中查看单元格、通过 RTC 双向同步、运行单元格，并在笔记本同目录输出纯文本 `result.json`。
+- 协作编辑 Jupyter Notebook 时，请在运行前自行核对 AI 给出的代码。
 
 ## 安装
 
-目前尚未上架 Obsidian 社区插件目录。需要使用 **Obsidian 桌面版 1.12.7 或更高版本**：
+需要使用 **Obsidian 桌面版 1.12.7 或更高版本**。可从 [Obsidian 社区插件页面](https://community.obsidian.md/plugins/simple-deepseek)安装，或在「设置 → 第三方插件 → 浏览」中搜索 **Simple DeepSeek**。
+
+手动安装方法：
 
 1. 从 GitHub Release 下载 `main.js`、`manifest.json`、`styles.css`。
 2. 将三个文件放入 `<笔记库>/.obsidian/plugins/simple-deepseek/`。

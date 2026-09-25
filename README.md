@@ -6,15 +6,18 @@ A desktop-only Obsidian plugin for DeepSeek conversations, PDF extraction with M
 
 ## Features
 
-- Show DeepSeek answers and collapsible thinking text. Render Markdown and math with Obsidian's renderer.
+- Render Markdown and math with Obsidian's renderer.
 - Keep multiple conversations in separate files. Show context usage and DeepSeek's reported cache-hit rate. Compress on demand or when context approaches 800,000 tokens.
 - Paste, select, or drag images and PDFs into the chat. Uploaded images use DeepSeek Flash vision; PDFs use MinerU. Image bytes are sent only in the one vision request, while its text description can be used in later turns.
 - Optionally reference a local paper library with `@`, including arXiv source retrieval and PDF-to-Markdown fallback.
 - In Notebook mode, launch a local JupyterLab server, show notebook cells in Obsidian, exchange changes through Jupyter RTC, run cells, and export a text-only `result.json` beside the notebook.
+- When collaborating on a Jupyter notebook, review AI-generated code yourself before running it.
 
 ## Install
 
-This plugin requires **Obsidian Desktop 1.12.7 or later**. It is not yet in the Obsidian Community directory.
+This plugin requires **Obsidian Desktop 1.12.7 or later**. Install it from the [Obsidian Community directory](https://community.obsidian.md/plugins/simple-deepseek), or search for **Simple DeepSeek** under **Settings → Community plugins → Browse**.
+
+For manual installation:
 
 1. Download the latest GitHub Release assets: `main.js`, `manifest.json`, and `styles.css`.
 2. Put those three files in `<vault>/.obsidian/plugins/simple-deepseek/`.
