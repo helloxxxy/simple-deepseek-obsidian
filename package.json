@@ -1,0 +1,26 @@
+{
+  "name": "simple-deepseek-obsidian",
+  "version": "0.1.0",
+  "author": "helloxxxy",
+  "private": true,
+  "description": "A desktop Obsidian plugin for DeepSeek chat, MinerU documents, and Jupyter notebooks.",
+  "license": "MIT",
+  "scripts": {
+    "build": "node build.cjs",
+    "test": "node --test test.cjs library-test.cjs secrets-test.cjs conversations-test.cjs notebook-test.cjs jupyter-local-test.cjs clipboard-test.cjs",
+    "release:check": "node scripts/verify-release.cjs"
+  },
+  "dependencies": {
+    "@jupyter/ydoc": "^4.1.1",
+    "fflate": "^0.8.3",
+    "lib0": "^0.2.114",
+    "pdf-lib": "1.17.1",
+    "ws": "^8.21.3",
+    "y-protocols": "^1.0.7",
+    "yjs": "^13.6.32"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "jsdom": "^26.1.0"
+  }
+}
