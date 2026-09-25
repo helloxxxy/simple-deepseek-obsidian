@@ -11,6 +11,7 @@
 - 选择、拖入或粘贴图片与 PDF。图片走 DeepSeek Flash 原生识图，PDF 走 MinerU。图片字节只用于当次识图请求，后续对话只携带识别文字。
 - 可选的 `@` 本地文献库引用，包括 arXiv 源码获取与 PDF 转 Markdown。
 - 可选的 Notebook 模式：启动本地 JupyterLab、在 Obsidian 中查看单元格、通过 RTC 双向同步、运行单元格，并在笔记本同目录输出纯文本 `result.json`。
+- Notebook 对话每轮可选不发送、发送增量（默认）或发送全部单元格源码与文字输出。
 - 协作编辑 Jupyter Notebook 时，请在运行前自行核对 AI 给出的代码。
 
 ## 安装

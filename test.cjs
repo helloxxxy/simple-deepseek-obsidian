@@ -212,7 +212,7 @@ function ui(mockChat, mockParse, options={}) {
   const secretApi={createKeyStore:()=>{if(options.noSecure)throw Error('unavailable');return {load:async()=>({...keyState}),save:async keys=>{Object.assign(keyState,JSON.parse(JSON.stringify(keys)));}};}};
   const conversationApi={validId:id=>typeof id==='string'&&/^conversation-[a-z0-9-]{8,120}$/i.test(id),createConversationStore:()=>({load:async()=>({items:[...conversationState.values()].map(value=>JSON.parse(JSON.stringify(value))),errors:[]}),save:async item=>conversationState.set(item.id,JSON.parse(JSON.stringify(item))),remove:async id=>conversationState.delete(id)})};
   const module={exports:{}};
-  vm.runInNewContext(fs.readFileSync(__dirname+'/src/main.js','utf8'),{module,require:name=>name==='obsidian'?{Plugin,ItemView,Component,MarkdownRenderer,requestUrl:async()=>({status:200,json:{}}),setIcon:(el,name)=>{const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('data-icon',name);el.append(svg);},Notice:class{constructor(s){notices.push(s);}}}:name==='electron'?{shell:{openExternal:url=>{opened.push(url);return Promise.resolve();}},clipboard:options.clipboard}:name==='./library'?(options.libraryApi || require('./src/library')):name==='./secrets'?secretApi:name==='./conversations'?conversationApi:name==='./jupyter-local'?(options.jupyterLocalApi || require('./src/jupyter-local')):name==='./clipboard'?require('./src/clipboard'):name==='./notebook'?(options.notebookApi || require('./src/notebook')):name==='./markdown'?{normalizeMath}:name==='./i18n'?require('./src/i18n'):name==='./context'?require('./src/context'):name==='./outline'?require('./src/outline'):name==='./pacing'?{TextPacer:TestPacer}:{chat:mockChat,describeImage:options.describeImage || core.describeImage,parseFile:mockParse,check:core.check},AbortController,setTimeout,clearTimeout,navigator:{clipboard:{writeText:async s=>copies.push(s)}}});
+  vm.runInNewContext(fs.readFileSync(__dirname+'/src/main.js','utf8'),{module,require:name=>name==='obsidian'?{Plugin,ItemView,Component,MarkdownRenderer,requestUrl:async()=>({status:200,json:{}}),setIcon:(el,name)=>{const svg=doc.createElementNS('http://www.w3.org/2000/svg','svg');svg.setAttribute('data-icon',name);el.append(svg);},Notice:class{constructor(s){notices.push(s);}}}:name==='electron'?{shell:{openExternal:url=>{opened.push(url);return Promise.resolve();}},clipboard:options.clipboard}:name==='./library'?(options.libraryApi || require('./src/library')):name==='./secrets'?secretApi:name==='./conversations'?conversationApi:name==='./jupyter-local'?(options.jupyterLocalApi || require('./src/jupyter-local')):name==='./clipboard'?require('./src/clipboard'):name==='./notebook'?(options.notebookApi || require('./src/notebook')):name==='./markdown'?{normalizeMath}:name==='./i18n'?require('./src/i18n'):name==='./context'?require('./src/context'):name==='./outline'?require('./src/outline'):name==='./pacing'?{TextPacer:TestPacer}:{chat:mockChat,describeImage:options.describeImage || core.describeImage,parseFile:mockParse,check:core.check},AbortController,setTimeout,clearTimeout,confirm:options.confirm || (()=>true),navigator:{clipboard:{writeText:async s=>copies.push(s)}}});
   const plugin=new module.exports();return{plugin,dom,doc,saved,renders,copies,notices,opened,keyState,conversationState};
 }
 test('UI: expired keys open each official API page once during the cooldown',async()=>{
@@ -220,6 +220,30 @@ test('UI: expired keys open each official API page once during the cooldown',asy
   const env=ui(async()=>{throw expired('deepseek');},async()=>{throw expired('mineru');});const{plugin,opened}=env;await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys={deepseek:'fake',mineru:'fake'};
   view.input.value='one';await view.send();view.input.value='two';await view.send();await view.upload(pdfFile);await view.upload(pdfFile);
   assert.deepEqual(opened,['https://platform.deepseek.com/api_keys','https://mineru.net/apiManage']);await view.onClose();
+});
+test('clear button warns that deletion is irreversible and leaves the conversation intact on cancel',async()=>{
+  const env=ui(async()=>{},async()=>{}, {confirm:()=>assert.fail('native confirmation must not open')});
+  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  env.doc.hasFocus=()=>true;
+  view.row('你','Keep this message');view.input.value='Keep this draft';
+  const clear=[...env.doc.querySelectorAll('.sd-actions button')].find(button=>button.textContent==='清空');
+  clear.focus();clear.click();let dialog=env.doc.querySelector('.sd-confirm');assert.ok(dialog);
+  assert.match(dialog.textContent,/无法恢复/);assert.equal(view.session.entries.length,1);
+  dialog.querySelector('button').click();await Promise.resolve();
+  assert.equal(view.session.entries.length,1);assert.equal(view.input.value,'Keep this draft');assert.equal(env.doc.activeElement,view.input);
+  clear.click();dialog=env.doc.querySelector('.sd-confirm');dialog.querySelector('.mod-warning').click();await Promise.resolve();
+  assert.equal(view.session.entries.length,0);assert.equal(view.input.value,'');assert.equal(env.doc.activeElement,view.input);
+  await view.onClose();
+});
+test('confirmation restores pending composer focus when the Obsidian window becomes active',async()=>{
+  const env=ui(async()=>{},async()=>{});await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  let foreground=false;env.doc.hasFocus=()=>foreground;
+  const clear=[...env.doc.querySelectorAll('.sd-actions button')].find(button=>button.textContent==='清空');
+  clear.focus();clear.click();env.doc.querySelector('.sd-confirm button').click();await Promise.resolve();
+  assert.equal(view.pendingComposerFocus,true);
+  foreground=true;env.dom.window.dispatchEvent(new env.dom.window.Event('focus'));
+  assert.equal(view.pendingComposerFocus,false);assert.equal(env.doc.activeElement,view.input);
+  await view.onClose();
 });
 test('Notebook UI starts local Jupyter, previews RTC cells and opens the exact notebook in default browser',async()=>{
   let started, connection, fake, stopped=0;
@@ -249,6 +273,21 @@ test('Notebook UI starts local Jupyter, previews RTC cells and opens the exact n
   assert.equal(stopped,1);assert.equal(env.plugin.jupyterUrl,'');assert.equal(view.notebookMode,false);
   await view.onClose();assert.equal(stopped,1);
 });
+test('Notebook run restores composer focus after disabling its clicked button',async()=>{
+  const env=ui(async()=>{},async()=>{});await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  const notebook={cells:[]};view.notebookClient={runAll:async()=>notebook,read:()=>notebook,close:()=>{}};
+  env.doc.hasFocus=()=>true;view.runAllButton.focus();
+  await view.runNotebookAll();
+  assert.equal(env.doc.activeElement,view.input);
+  await view.onClose();
+});
+test('completed chat restores the composer after sending from its button',async()=>{
+  const env=ui(async(_key,_messages,_signal,onDelta)=>{onDelta('Hello');return{completion_tokens:2};},async()=>{});
+  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();env.plugin.keys.deepseek='test-key';
+  env.doc.hasFocus=()=>true;view.input.value='Question';view.sendButton.focus();
+  await view.send();assert.equal(env.doc.activeElement,view.input);
+  await view.onClose();
+});
 test('closing Notebook mode does not shut down a reused server with no owned child process',async()=>{
   class FakeRtcClient { async connect(){return{cells:[]};} onChange(){return()=>{};} close(){} }
   const env=ui(async()=>{},async()=>{}, {jupyterLocalApi:{startLocalJupyter:async()=>({baseUrl:'http://127.0.0.1:19003',token:'prior',root:'C:/work',name:'test.ipynb',browserUrl:'http://127.0.0.1:19003/lab/tree/test.ipynb?token=prior',reused:true}),stopLocalJupyter:async()=>assert.fail('must not stop a reused server')},notebookApi:{...require('./src/notebook'),JupyterRtcClient:FakeRtcClient}});
@@ -264,6 +303,44 @@ test('Notebook UI accepts an alternate JSON patch without changing the original 
   const raw='```json\n{"baseHash":null,"operations":[{"op":"insert_cell","index":1,"cellType":"code","source":"print(42)"}]}\n```';
   const reply=view.row('deepseek-flash',raw);view.addPatchAction(reply);
   assert.equal(reply.entry.raw,raw);assert.equal(reply.patchButton?.textContent,'检查并应用 Notebook 修改');
+  await view.onClose();
+});
+test('Notebook edit confirmation uses the selected English interface language',async()=>{
+  const env=ui(async()=>{},async()=>{}, {saved:{uiLanguage:'en'}});
+  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  const notebook={cells:[]};let applied=0;
+  view.notebookClient={read:()=>notebook,applyPatch:async()=>{applied++;return notebook;},close(){}};
+  env.doc.hasFocus=()=>true;
+  const hash='b'.repeat(64),user=view.row('你','Add a cell');
+  user.entry.contextText=`[Notebook delta]\n{"currentHash":"${hash}"}`;user.entry.notebookAttached=true;
+  const reply=view.row('deepseek-flash','```notebook-patch\n{"baseHash":null,"operations":[{"type":"insert_cell","index":1,"cellType":"code","source":"print(42)"}]}\n```');
+  view.addPatchAction(reply);reply.patchButton.focus();reply.patchButton.click();
+  let dialog=env.doc.querySelector('.sd-confirm');assert.ok(dialog);
+  assert.match(dialog.textContent,/Apply these edits through RTC:/);
+  assert.match(dialog.textContent,/Insert a code cell at index 1 \(9 characters\)/);
+  assert.match(dialog.textContent,/After confirmation, Jupyter will update in real time\./);
+  assert.doesNotMatch(dialog.textContent,/[\u4e00-\u9fff]/);
+  dialog.querySelector('button').click();await Promise.resolve();assert.equal(applied,0);assert.equal(env.doc.activeElement,view.input);
+  reply.patchButton.click();dialog=env.doc.querySelector('.sd-confirm');assert.ok(dialog);
+  dialog.querySelector('.mod-cta').click();await new Promise(setImmediate);
+  assert.equal(applied,1);assert.equal(env.doc.querySelector('.sd-confirm'),null);assert.equal(env.doc.activeElement,view.input);
+  await view.onClose();
+});
+test('English Notebook events translate stored operation labels without changing archived text or cell output',async()=>{
+  const env=ui(async()=>{},async()=>{}, {saved:{uiLanguage:'en'}});
+  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  const raw='**AI 修改已通过 RTC 同步**\n\n1. 在 17 插入 markdown 单元格（272 字符）\n2. 修改单元格 中文-id（12 字符）\n\nNotebook 哈希：abc123';
+  const entry={label:'Notebook 操作',raw,notebookEvent:true};view.session.entries.push(entry);
+  const state=view.row(entry.label,raw,entry);await view.render(state);
+  assert.match(state.body.textContent,/Insert a markdown cell at index 17 \(272 characters\)/);
+  assert.match(state.body.textContent,/Update cell 中文-id \(12 characters\)/);
+  assert.match(state.body.textContent,/Notebook hash: abc123/);
+  assert.equal(entry.raw,raw);
+  view.logNotebookEvent('运行单元格 1','[{"text":"中文输出"}]');await new Promise(setImmediate);
+  const output=[...view.rows].at(-1);assert.match(output.body.textContent,/Ran cell 1/);assert.match(output.body.textContent,/中文输出/);
+  env.plugin.uiLanguage='zh';view.refreshLanguage();await new Promise(setImmediate);
+  assert.match(state.body.textContent,/在 17 插入 markdown 单元格/);
+  assert.equal(entry.raw,raw);
   await view.onClose();
 });
 test('Notebook pending delta count resets after compression and clearing a conversation',async()=>{
@@ -283,6 +360,44 @@ test('Notebook pending delta count resets after compression and clearing a conve
   view.clear();assert.equal(view.notebookSnapshot,null);assert.match(view.notebookAttachLabel.textContent,/待发 1 格/);
   await view.onClose();
 });
+test('deleting an unrelated exchange preserves the Notebook delta baseline',async()=>{
+  const api=require('./src/notebook');
+  const notebook={cells:[{id:'calc',cell_type:'code',source:'x = 1',outputs:[]}]};
+  const snapshot=api.notebookSnapshot(notebook), context='first'+api.notebookContext(api.notebookDelta(notebook,null));
+  const env=ui(async()=>{},async()=>{});await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
+  view.notebookClient={read:()=>notebook,close(){}};view.notebookSnapshot=snapshot;view.session.notebookSnapshot=snapshot;
+  const first=view.row('你','first');first.entry.contextText=context;first.entry.notebookAttached=true;
+  const firstReply=view.row('deepseek-flash','answer one');
+  view.messages.push({role:'user',content:context},{role:'assistant',content:'answer one'});
+  view.row('你','second');const secondReply=view.row('deepseek-flash','answer two');
+  view.messages.push({role:'user',content:'second'},{role:'assistant',content:'answer two'});
+  await view.deleteTurn(secondReply.entry);
+  assert.equal(view.notebookSnapshot?.hash,snapshot.hash);assert.match(view.notebookAttachLabel.textContent,/待发 0 格/);
+  await view.deleteTurn(firstReply.entry);
+  assert.equal(view.notebookSnapshot,null);assert.match(view.notebookAttachLabel.textContent,/待发 1 格/);
+  await view.onClose();
+});
+test('Notebook send mode defaults to changes and supports none or full text',async()=>{
+  const api=require('./src/notebook'),requests=[];
+  const notebook={cells:[{id:'calc',cell_type:'code',source:'x = 1',outputs:[]}]};
+  const env=ui(async(_key,messages,_signal,onDelta)=>{requests.push(messages.at(-1).content);onDelta('OK');return{completion_tokens:2};},async()=>{});
+  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();env.plugin.keys.deepseek='test-key';
+  view.notebookMode=true;view.notebookClient={read:()=>notebook,close(){}};
+  assert.equal(view.notebookAttach.value,'delta');
+  view.input.value='first';await view.send();
+  const firstHash=view.notebookSnapshot.hash;
+  assert.match(requests[0],/\[Notebook delta/);assert.match(requests[0],/"previousHash":null/);
+  notebook.cells[0].source='x = 2';view.notebookAttach.value='none';view.refreshNotebookDeltaLabel();
+  view.input.value='second';await view.send();
+  assert.ok(!requests[1].includes('[Notebook delta'));assert.equal(view.notebookSnapshot.hash,firstHash);
+  assert.match(view.notebookAttachLabel.textContent,/增量待发 1 格/);
+  view.notebookAttach.value='all';view.refreshNotebookDeltaLabel();assert.match(view.notebookAttachLabel.textContent,/全部 1 格/);
+  view.input.value='third';await view.send();
+  assert.match(requests[2],/"previousHash":null/);assert.match(requests[2],/"source":"x = 2"/);
+  assert.equal(view.notebookSnapshot.hash,api.notebookHash(notebook));
+  view.notebookAttach.value='delta';view.refreshNotebookDeltaLabel();assert.match(view.notebookAttachLabel.textContent,/待发 0 格/);
+  await view.onClose();
+});
 test('automatic compression resends full Notebook content before advancing the delta baseline',async()=>{
   const notebookApi=require('./src/notebook');
   const notebook={cells:[{id:'one',cell_type:'code',source:'print(42)',outputs:[]}]};
@@ -292,7 +407,7 @@ test('automatic compression resends full Notebook content before advancing the d
     sent=messages.at(-1).content;delta('done');return{prompt_tokens:100,completion_tokens:2};
   },async()=>{});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
-  view.notebookClient={read:()=>notebook,close(){}};view.notebookMode=true;view.notebookAttach.checked=true;
+  view.notebookClient={read:()=>notebook,close(){}};view.notebookMode=true;view.notebookAttach.value='delta';
   const snapshot=notebookApi.notebookSnapshot(notebook);view.notebookSnapshot=snapshot;view.session.notebookSnapshot=snapshot;
   view.messages.push({role:'user',content:'old'.repeat(5000)+notebookApi.notebookContext(notebookApi.notebookDelta(notebook,null))});
   view.session.meter={tokens:800000,count:1,estimated:true};view.input.value='继续';
@@ -366,7 +481,7 @@ test('keys: serialized writes keep newest value; failed save can recover',async(
   let fail=true;const env=ui(async()=>{},async()=>'',{save:async()=>{if(fail){fail=false;throw Error('disk');}}});await env.plugin.onload();await assert.rejects(env.plugin.saveKeys());await env.plugin.saveKeys();assert.equal(env.saved.length,1);
 });
 test('UI: clearing during streaming prevents late text or stale controls',async()=>{
-  let resolveChat,delta;const{plugin,doc}=ui(async(k,m,s,onDelta)=>{delta=onDelta;await new Promise(r=>resolveChat=r);},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.deepseek='fake';view.input.value='hi';const pending=view.send();await new Promise(setImmediate);view.clear();delta('late');resolveChat();await pending;assert.equal(doc.querySelectorAll('.sd-message').length,0);assert.equal(view.messages.length,0);assert.equal(view.sendButton.disabled,false);await view.onClose();
+  let resolveChat,delta;const{plugin,doc}=ui(async(k,m,s,onDelta)=>{delta=onDelta;await new Promise(r=>resolveChat=r);},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.deepseek='fake';view.input.value='hi';const pending=view.send();await new Promise(setImmediate);assert.equal(view.notebookAttach.disabled,true);view.clear();assert.equal(view.notebookAttach.disabled,false);delta('late');resolveChat();await pending;assert.equal(doc.querySelectorAll('.sd-message').length,0);assert.equal(view.messages.length,0);assert.equal(view.sendButton.disabled,false);await view.onClose();
 });
 test('UI: clear during native rendering unloads component and discards DOM',async()=>{
   let release;const{plugin,doc}=ui(async()=>{},async()=>'',{render:async()=>new Promise(r=>release=r)});await plugin.onload();const view=plugin.factory({});await view.onOpen();const row=view.row('test','$a$');const drawing=view.render(row);view.clear();release();await drawing;assert.equal(doc.querySelectorAll('.sd-message').length,0);assert.equal(view.children.size,0);await view.onClose();

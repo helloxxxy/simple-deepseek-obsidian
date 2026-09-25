@@ -1,7 +1,7 @@
 {
   "id": "simple-deepseek",
   "name": "Simple DeepSeek",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "minAppVersion": "1.12.7",
   "description": "Chat with DeepSeek, parse PDFs with MinerU, and edit Jupyter notebooks in real time.",
   "author": "helloxxxy",

@@ -1,6 +1,6 @@
 {
   "name": "simple-deepseek-obsidian",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "author": "helloxxxy",
   "private": true,
   "description": "A desktop Obsidian plugin for DeepSeek chat, MinerU documents, and Jupyter notebooks.",

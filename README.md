@@ -11,6 +11,7 @@ A desktop-only Obsidian plugin for DeepSeek conversations, PDF extraction with M
 - Paste, select, or drag images and PDFs into the chat. Uploaded images use DeepSeek Flash vision; PDFs use MinerU. Image bytes are sent only in the one vision request, while its text description can be used in later turns.
 - Optionally reference a local paper library with `@`, including arXiv source retrieval and PDF-to-Markdown fallback.
 - In Notebook mode, launch a local JupyterLab server, show notebook cells in Obsidian, exchange changes through Jupyter RTC, run cells, and export a text-only `result.json` beside the notebook.
+- For each Notebook turn, send no notebook content, only changes (the default), or all cell source and text outputs.
 - When collaborating on a Jupyter notebook, review AI-generated code yourself before running it.
 
 ## Install
