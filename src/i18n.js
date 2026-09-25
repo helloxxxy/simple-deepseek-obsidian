@@ -24,7 +24,8 @@ const replacements = [
   ['输入本机 .ipynb 文件的完整路径；不存在则新建', 'Full path to a .ipynb file; created if missing'],
   ['保存本机设置', 'Save local settings'], ['模型名称', 'Model name'],
   ['Notebook 模式', 'Notebook mode'], ['Notebook 预览', 'Notebook preview'],
-  ['本轮附带 Notebook 增量', 'Attach Notebook changes to this turn'],
+  ['发送 Notebook', 'Send Notebook'], ['不发', 'Do not send'], ['发增量', 'Send changes'], ['发全部', 'Send all'],
+  ['增量待发', 'Changes pending'], ['待发', 'Pending'], ['全部', 'All'], ['格', 'cells'],
   ['运行第几个单元格', 'Cell number to run'], ['单元格序号，从 1 开始', 'Cell number, starting at 1'],
   ['连接 Jupyter RTC', 'Connect Jupyter RTC'], ['RTC 已连接', 'RTC connected'], ['正在连接…', 'Connecting…'],
   ['正在同步…', 'Syncing…'], ['正在运行…', 'Running…'], ['未连接', 'Disconnected'], ['存在冲突', 'Conflict'],
@@ -32,6 +33,7 @@ const replacements = [
   ['空 Notebook，可在 JupyterLab 页面添加单元格。', 'Empty notebook. Add cells in JupyterLab.'],
   ['请先连接 Jupyter RTC', 'Connect Jupyter RTC first'], ['Notebook 操作失败', 'Notebook operation failed'],
   ['检查并应用 Notebook 修改', 'Review and apply Notebook edits'], ['已同步', 'Synced'],
+  ['应用修改', 'Apply edits'],
   ['思考过程', 'Thinking'], ['复制 Markdown', 'Copy Markdown'], ['复制', 'Copy '],
   ['删除本轮对话并恢复输入', 'Delete this exchange and restore the input'], ['删除本轮对话', 'Delete this exchange'],
   ['选择发送范围', 'Select content to send'], ['选择文本范围', 'Select text range'],
@@ -45,6 +47,8 @@ const replacements = [
   ['上传 PDF / 图片', 'Upload PDF / image'], ['松开以上传 PDF 或图片', 'Drop to upload a PDF or image'],
   ['选择附件', 'Select attachment'], ['发送', 'Send'], ['停止当前操作', 'Stop current operation'], ['停止', 'Stop'],
   ['压缩', 'Compress'], ['清空', 'Clear'], ['删除当前对话历史', 'Delete this conversation'],
+  ['清空当前对话', 'Clear this conversation'], ['永久清空', 'Delete permanently'],
+  ['确定清空当前对话吗？当前对话及其存档将被永久删除，无法恢复。', 'Clear this conversation? Its messages and saved history will be permanently deleted and cannot be recovered.'],
   ['思考强度', 'Reasoning effort'], ['不限速', 'Unlimited'], ['最大', 'Max'], ['低', 'Low'], ['高', 'High'],
   ['下一个', 'Next'], ['上一条回复', 'Previous reply'], ['下一条回复', 'Next reply'], ['置底', 'Bottom'], ['回复导航', 'Reply navigation'],
   ['对话', 'Conversation'], ['消息', 'Message'], ['你', 'You'], ['图片 · ', 'Image · '],
@@ -250,4 +254,28 @@ function translate(text, language) {
   for (const [original, english] of replacements) result = original.length === 1 ? (result === original ? english : result) : result.replaceAll(original, english);
   return result;
 }
-module.exports = { translate };
+function translateNotebookEvent(text, language) {
+  const source = String(text ?? '');
+  if (language !== 'en') return source;
+  const heading = /^\*\*([^*]+)\*\*/.exec(source);
+  if (!heading) return source;
+  const title = heading[1];
+  let detail = source.slice(heading[0].length);
+  if (title === 'AI 修改已通过 RTC 同步') {
+    detail = detail.split('\n').map(line => {
+      let match = /^(\d+\.\s*)?在 (\d+|末尾) 插入 ([\w-]+) 单元格（(\d+) 字符）$/.exec(line);
+      if (match) return `${match[1] || ''}Insert a ${match[3]} cell ${match[2] === '末尾' ? 'at the end' : `at index ${match[2]}`} (${match[4]} characters)`;
+      match = /^(\d+\.\s*)?修改单元格 (.+)（(\d+) 字符）$/.exec(line);
+      if (match) return `${match[1] || ''}Update cell ${match[2]} (${match[3]} characters)`;
+      match = /^(\d+\.\s*)?删除单元格 (.+)$/.exec(line);
+      if (match) return `${match[1] || ''}Delete cell ${match[2]}`;
+      return line.startsWith('Notebook 哈希：') ? 'Notebook hash: ' + line.slice('Notebook 哈希：'.length) : line;
+    }).join('\n');
+  } else if (title === '已连接 Jupyter RTC') {
+    detail = detail.replace(/^Notebook：/m, 'Notebook: ').replace(/^哈希：/m, 'Hash: ');
+  } else if (title === '全量运行完成') {
+    detail = detail.replace(/^Notebook 哈希：/m, 'Notebook hash: ');
+  }
+  return `**${translate(title, language)}**${detail}`;
+}
+module.exports = { translate, translateNotebookEvent };

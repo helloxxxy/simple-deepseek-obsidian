@@ -11,7 +11,7 @@ const { outline, headingAt, mergeRanges, withOutlineContext } = require('./outli
 const { NOTEBOOK_SYSTEM_PROMPT, safeNotebook, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, notebookHash, parsePatch, describePatch, requestUrlFetch, JupyterRtcClient } = require('./notebook');
 const { startLocalJupyter, stopLocalJupyter } = require('./jupyter-local');
 const { clipboardAttachments, materializeClipboardAttachment } = require('./clipboard');
-const { translate } = require('./i18n');
+const { translate, translateNotebookEvent } = require('./i18n');
 const VIEW = 'simple-deepseek-chat';
 const STREAM_MARKDOWN_MS = 1000;
 const API_MANAGE_PAGES = {
@@ -60,7 +60,7 @@ class ChatView extends ItemView {
   localizeTree(node) {
     if (!node || !this.textOrigins) return;
     if (node.nodeType === 3) {
-      if (node.parentElement?.closest('.sd-body, .sd-thinking-body, .sd-notebook-cell-body, .sd-notebook-cell-summary, .sd-outline-heading, .sd-range-preview-text, .sd-range-name, .sd-mentions button')) return;
+      if (node.parentElement?.closest('.sd-body, .sd-thinking-body, .sd-notebook-cell-body, .sd-notebook-cell-summary, .sd-outline-heading, .sd-range-preview-text, .sd-range-name, .sd-mentions button, .sd-confirm pre')) return;
       const prior = this.textOrigins.get(node);
       const raw = prior && node.data === prior.rendered ? prior.raw : node.data;
       const rendered = translate(raw, this.plugin.uiLanguage);
@@ -69,7 +69,7 @@ class ChatView extends ItemView {
       return;
     }
     if (node.nodeType !== 1) return;
-    if (node.closest('.sd-body, .sd-thinking-body, .sd-notebook-cell-body, .sd-notebook-cell-summary, .sd-outline-heading, .sd-range-preview-text, .sd-range-name, .sd-language-select, .sd-mentions button')) return;
+    if (node.closest('.sd-body, .sd-thinking-body, .sd-notebook-cell-body, .sd-notebook-cell-summary, .sd-outline-heading, .sd-range-preview-text, .sd-range-name, .sd-language-select, .sd-mentions button, .sd-confirm pre')) return;
     if (node.tagName === 'OPTION' && node.parentElement === this.conversationSelect) return;
     for (const name of ['aria-label', 'aria-valuetext', 'title', 'placeholder']) {
       if (!node.hasAttribute(name)) continue;
@@ -86,13 +86,24 @@ class ChatView extends ItemView {
   refreshLanguage() {
     this.refreshConversationOptions();
     this.refreshStats();
-    for (const row of this.rows) if (row.entry.usage) row.usageEl.textContent = formatUsage(row.entry.usage, row.entry.durationMs, this.plugin.uiLanguage);
+    this.refreshNotebookDeltaLabel();
+    for (const row of this.rows) {
+      if (row.entry.usage) row.usageEl.textContent = formatUsage(row.entry.usage, row.entry.durationMs, this.plugin.uiLanguage);
+      if (row.entry.notebookEvent) { row.version++; void this.render(row); }
+    }
     this.localizeTree(this.contentEl);
   }
   async onOpen() {
     this.closed = false;
     this.textOrigins = new WeakMap(); this.attributeOrigins = new WeakMap();
     const root = this.contentEl; root.empty(); root.addClass('simple-deepseek');
+    this.windowFocusListener = () => {
+      if (!this.pendingComposerFocus) return;
+      const origin = this.pendingComposerFocusOrigin, doc = this.input.ownerDocument;
+      this.pendingComposerFocus = false; this.pendingComposerFocusOrigin = null;
+      if (!this.closed && (doc.activeElement === doc.body || doc.activeElement === origin || doc.activeElement === this.input)) this.input.focus({ preventScroll: true });
+    };
+    root.ownerDocument.defaultView?.addEventListener('focus', this.windowFocusListener);
     const keys = root.createEl('details');
     keys.createEl('summary', { text: '密钥与模型设置' });
     const languageLine = keys.createEl('label', { cls: 'sd-key' }); languageLine.createSpan({ text: '界面语言' });
@@ -153,7 +164,14 @@ class ChatView extends ItemView {
     const notebookTop = this.notebookPanel.createDiv({ cls: 'sd-notebook-top' });
     this.notebookConnect = notebookTop.createEl('button', { text: '连接 Jupyter RTC' }); this.notebookConnect.addEventListener('click', () => { if (this.notebookClient) this.disconnectNotebook(); else void this.connectNotebook(); });
     this.notebookStatus = notebookTop.createSpan({ cls: 'sd-notebook-status', text: '未连接' });
-    const attachLabel = notebookTop.createEl('label', { cls: 'sd-notebook-attach' }); this.notebookAttach = attachLabel.createEl('input', { type: 'checkbox' }); this.notebookAttachLabel = attachLabel.createSpan({ text: '本轮附带 Notebook 增量' });
+    const attachLabel = notebookTop.createEl('label', { cls: 'sd-notebook-attach' }); attachLabel.createSpan({ text: '发送 Notebook' });
+    this.notebookAttach = attachLabel.createEl('select', { attr: { 'aria-label': '发送 Notebook' } });
+    for (const [value, label] of [['none', '不发'], ['delta', '发增量'], ['all', '发全部']]) {
+      const option = this.notebookAttach.createEl('option', { text: label }); option.value = value;
+    }
+    this.notebookAttach.value = 'delta';
+    this.notebookAttach.addEventListener('change', () => this.refreshNotebookDeltaLabel());
+    this.notebookAttachLabel = notebookTop.createSpan({ cls: 'sd-notebook-pending' });
     const notebookActions = this.notebookPanel.createDiv({ cls: 'sd-notebook-actions' });
     this.runCellButton = notebookActions.createEl('button', { text: '运行单元格' }); this.runCellButton.addEventListener('click', () => void this.runNotebookCell());
     this.runAllButton = notebookActions.createEl('button', { text: '全量运行' }); this.runAllButton.addEventListener('click', () => void this.runNotebookAll());
@@ -223,7 +241,16 @@ class ChatView extends ItemView {
     this.sendButton.addEventListener('click', () => { if (this.controller) this.controller.abort(); else void this.send(); });
     this.compressButton = actions.createEl('button', { text: '压缩', cls: 'sd-compress' });
     this.compressButton.addEventListener('click', () => { void this.manualCompress(); });
-    const clear = actions.createEl('button', { text: '清空' }); clear.title = '删除当前对话历史'; clear.addEventListener('click', () => this.clear());
+    const clear = actions.createEl('button', { text: '清空' }); clear.title = '删除当前对话历史';
+    clear.addEventListener('click', async () => {
+      const accepted = await this.confirmAction({
+        title: translate('清空当前对话', this.plugin.uiLanguage),
+        message: translate('确定清空当前对话吗？当前对话及其存档将被永久删除，无法恢复。', this.plugin.uiLanguage),
+        confirmText: translate('永久清空', this.plugin.uiLanguage),
+        danger: true
+      });
+      if (accepted && !this.closed) this.clear();
+    });
     const effortLine = actions.createEl('label', { cls: 'sd-thinking-effort' }); effortLine.createSpan({ text: '思考强度' });
     this.effortSelect = effortLine.createEl('select', { attr: { 'aria-label': '思考强度', title: 'DeepSeek 思考强度' } });
     for (const [value,label] of [['low','低'],['high','高'],['max','最大']]) { const option = this.effortSelect.createEl('option', { text: label }); option.value = value; }
@@ -310,7 +337,7 @@ class ChatView extends ItemView {
     const item = this.plugin.addConversation();
     if (!this.closed) await this.showConversation(item.id);
     await this.plugin.saveSession();
-    if (!this.closed) this.input.focus();
+    this.restoreComposerFocus(null, true);
   }
   toggleNotebookMode() {
     this.notebookMode = !this.notebookMode; this.notebookPanel.hidden = !this.notebookMode;
@@ -410,9 +437,14 @@ class ChatView extends ItemView {
   refreshNotebookDeltaLabel() {
     if (!this.notebookAttachLabel) return;
     try {
-      const delta = notebookDelta(this.notebookClient.read(), this.notebookSnapshot);
-      this.notebookAttachLabel.textContent = `本轮附带 Notebook 增量（待发 ${delta.changed.length + delta.removed.length} 格）`;
-    } catch { this.notebookAttachLabel.textContent = '本轮附带 Notebook 增量'; }
+      const notebook = this.notebookClient.read();
+      const mode = this.notebookAttach.value;
+      let count;
+      if (mode === 'all') count = safeNotebook(notebook).cells.length;
+      else { const delta = notebookDelta(notebook, this.notebookSnapshot); count = delta.changed.length + delta.removed.length; }
+      const label = mode === 'all' ? '全部' : mode === 'none' ? '增量待发' : '待发';
+      this.notebookAttachLabel.textContent = `${translate(label, this.plugin.uiLanguage)} ${count} ${translate('格', this.plugin.uiLanguage)}`;
+    } catch { this.notebookAttachLabel.textContent = ''; }
   }
   renderNotebookPreview(notebook) {
     if (!this.notebookPreviewBody || !notebook) return;
@@ -438,12 +470,31 @@ class ChatView extends ItemView {
       if (openIds.has(cell.cellId) || (!openIds.size && cell.index === 0)) { item.open = true; fill(); }
     }
   }
+  restoreComposerFocus(origin = null, force = false) {
+    if (this.closed || !this.input?.isConnected) return;
+    const doc = this.input.ownerDocument, active = doc.activeElement;
+    if (!force && active !== doc.body && active !== origin && active !== this.input) return;
+    if (!doc.hasFocus()) {
+      this.pendingComposerFocus = true;
+      this.pendingComposerFocusOrigin = origin || this.pendingComposerFocusOrigin || null;
+      return;
+    }
+    this.pendingComposerFocus = false; this.pendingComposerFocusOrigin = null;
+    this.input.focus({ preventScroll: true });
+  }
   async notebookOperation(work) {
     if (!this.notebookClient) { this.setNotebookStatus('disconnected', '请先连接 Jupyter RTC'); return; }
+    const doc = this.input.ownerDocument;
+    const origin = doc.activeElement;
+    const restoreComposerFocus = [this.runCellButton, this.runAllButton, this.resultButton].includes(origin) || origin?.classList?.contains('sd-notebook-apply');
     for (const button of [this.runCellButton, this.runAllButton, this.resultButton]) button.disabled = true;
     try { await work(); }
     catch (error) { this.setNotebookStatus(error.message?.includes('变化') ? 'conflict' : 'connected', error.message || 'Notebook 操作失败'); }
-    finally { if (this.notebookClient) { try { this.scheduleNotebookPreview(this.notebookClient.read()); } catch {} } for (const button of [this.runCellButton, this.runAllButton, this.resultButton]) button.disabled = false; }
+    finally {
+      if (this.notebookClient) { try { this.scheduleNotebookPreview(this.notebookClient.read()); } catch {} }
+      for (const button of [this.runCellButton, this.runAllButton, this.resultButton]) button.disabled = false;
+      if (restoreComposerFocus) this.restoreComposerFocus(origin);
+    }
   }
   async runNotebookCell() {
     await this.notebookOperation(async () => {
@@ -460,6 +511,46 @@ class ChatView extends ItemView {
   async writeNotebookResult() {
     await this.notebookOperation(async () => { const target = await this.notebookClient.writeResultJson(); this.logNotebookEvent('已输出 result.json', target); this.setNotebookStatus('connected'); });
   }
+  confirmAction({ title, message, confirmText, danger = false }) {
+    if (this.confirmationFinish) return Promise.resolve(false);
+    const doc = this.contentEl.ownerDocument;
+    const origin = doc.activeElement;
+    return new Promise(resolve => {
+      const overlay = this.contentEl.createDiv({ cls: 'sd-confirm-overlay' });
+      const dialog = overlay.createDiv({ cls: 'sd-confirm', attr: { role: 'dialog', 'aria-modal': 'true', 'aria-label': title } });
+      dialog.createEl('strong', { text: title });
+      dialog.createEl('pre', { text: message });
+      const actions = dialog.createDiv({ cls: 'sd-confirm-actions' });
+      const cancel = actions.createEl('button', { text: translate('取消', this.plugin.uiLanguage) });
+      const apply = actions.createEl('button', { text: confirmText, cls: danger ? 'mod-warning' : 'mod-cta' });
+      let done = false;
+      const finish = accepted => {
+        if (done) return;
+        done = true; overlay.remove(); this.confirmationFinish = null;
+        this.restoreComposerFocus(origin, true);
+        resolve(accepted);
+      };
+      this.confirmationFinish = () => finish(false);
+      cancel.addEventListener('click', () => finish(false));
+      apply.addEventListener('click', () => finish(true));
+      overlay.addEventListener('click', event => { if (event.target === overlay) finish(false); });
+      dialog.addEventListener('keydown', event => {
+        if (event.key === 'Escape') { event.preventDefault(); finish(false); }
+        else if (event.key === 'Tab') {
+          event.preventDefault();
+          (doc.activeElement === apply ? cancel : apply).focus();
+        }
+      });
+      cancel.focus();
+    });
+  }
+  confirmNotebookPatch(patch) {
+    return this.confirmAction({
+      title: translate('检查并应用 Notebook 修改', this.plugin.uiLanguage),
+      message: `${translate('将通过 RTC 应用以下修改：', this.plugin.uiLanguage)}\n\n${describePatch(patch, this.plugin.uiLanguage)}\n\n${translate('确认后，Jupyter 页面会实时更新。', this.plugin.uiLanguage)}`,
+      confirmText: translate('应用修改', this.plugin.uiLanguage)
+    });
+  }
   addPatchAction(state) {
     if (typeof parsePatch !== 'function' || state.patchButton || state.streaming || state.entry.label === '你' || state.entry.notebookEvent) return;
     const index = this.session.entries.indexOf(state.entry);
@@ -473,8 +564,7 @@ class ChatView extends ItemView {
     const button = state.element.querySelector('.sd-message-footer').createEl('button', { text: '检查并应用 Notebook 修改', cls: 'sd-notebook-apply' }); state.patchButton = button;
     button.addEventListener('click', () => void this.notebookOperation(async () => {
       if (!this.notebookClient) throw Error('请先连接 Jupyter RTC');
-      const message = `将通过 RTC 应用以下修改：\n\n${describePatch(patch)}\n\n确认后，Jupyter 页面会实时更新。`;
-      if (!globalThis.confirm(message)) return;
+      if (!await this.confirmNotebookPatch(patch)) return;
       const notebook = await this.notebookClient.applyPatch(patch); this.notebookLatest = notebook; button.disabled = true; button.textContent = '已同步';
       this.logNotebookEvent('AI 修改已通过 RTC 同步', `${describePatch(patch)}\n\nNotebook 哈希：${notebookHash(notebook)}`);
     }));
@@ -537,7 +627,7 @@ class ChatView extends ItemView {
         track.style.setProperty('--range-start',(lo/text.length*100)+'%');track.style.setProperty('--range-end',(hi/text.length*100)+'%');
         if(preview){startTitle.textContent='起点所在标题：'+headingAt(parsed.headings,lo);endTitle.textContent='终点所在标题：'+headingAt(parsed.headings,Math.max(lo,hi-1));startPreview.textContent=ranges.length?text.slice(lo,Math.min(ranges[0].end,lo+400)):'';endPreview.textContent=ranges.length?text.slice(Math.max(ranges.at(-1).start,hi-400),hi):'';startTitle.title=startTitle.textContent;endTitle.title=endTitle.textContent;startPreview.scrollTop=0;endPreview.scrollTop=endPreview.scrollHeight;}
       };
-      const finish=(error,value)=>{if(done)return;done=true;signal.removeEventListener('abort',abort);panel.remove();if(!this.closed)this.input.focus();if(error)reject(error);else resolve(value);};
+      const finish=(error,value)=>{if(done)return;done=true;signal.removeEventListener('abort',abort);panel.remove();this.restoreComposerFocus(null,true);if(error)reject(error);else resolve(value);};
       const abort=()=>{const error=new Error('已取消范围选择');error.name='AbortError';finish(error);};
       start.addEventListener('input',()=>update(start));end.addEventListener('input',()=>update(end));
       all.addEventListener('click',()=>{start.value='0';end.value=String(text.length);for(let i=0;i<units.length;i++)selected.add(i);update();});
@@ -567,11 +657,11 @@ class ChatView extends ItemView {
     if (direct) this.messages.splice(offset, removedCount);
     else { this.messages.splice(0, this.messages.length, ...this.session.entries.flatMap(asMessages)); this.session.compactions = 0; }
     this.session.meter = null;
-    this.resetNotebookDelta();
+    this.reconcileNotebookSnapshot(); this.refreshNotebookDeltaLabel();
     this.disposeRows(); this.feed.empty(); this.replyAnchor = null;
     for (const item of this.session.entries) this.row(item.label, item.raw, item);
     this.hideMentions(); const draft = this.input.value;
-    this.input.value = user.raw + (draft.trim() ? '\n\n' + draft : ''); this.input.focus(); this.input.setSelectionRange(0, user.raw.length);
+    this.input.value = user.raw + (draft.trim() ? '\n\n' + draft : ''); this.restoreComposerFocus(null, true); this.input.setSelectionRange(0, user.raw.length);
     this.refreshConversationOptions(); this.refreshStats(); this.status.textContent = compressed && !direct ? '已删除本轮；原压缩摘要已移除，上下文由剩余对话重建。' : '已删除本轮，原提问已放回输入框。';
     await this.plugin.saveSession();
   }
@@ -600,7 +690,7 @@ class ChatView extends ItemView {
     const item = this.mentionItems?.[index]; if (!item || !this.mentionRange) return;
     const {start,end} = this.mentionRange; const mention = '@[' + item.id + '] ';
     this.input.value = this.input.value.slice(0,start) + mention + this.input.value.slice(end);
-    this.input.setSelectionRange(start + mention.length, start + mention.length); this.input.focus(); this.hideMentions();
+    this.input.setSelectionRange(start + mention.length, start + mention.length); this.restoreComposerFocus(null, true); this.hideMentions();
   }
   mentionKey(event) {
     if (event.isComposing || event.keyCode === 229 || this.mentionPopup?.hidden) return false;
@@ -709,7 +799,7 @@ class ChatView extends ItemView {
     const version = state.version;
     const raw = state.raw;
     if (state.streaming && raw.length <= (state.committed || 0)) return;
-    const markdown = normalizeMath(raw);
+    const markdown = normalizeMath(state.entry.notebookEvent ? translateNotebookEvent(raw, this.plugin.uiLanguage) : raw);
     const stage = state.body.ownerDocument.createElement('div'); stage.className = 'markdown-rendered sd-markdown';
     const component = new Component(); this.addChild(component); state.inflight = component;
     state.running = (async () => {
@@ -759,10 +849,13 @@ class ChatView extends ItemView {
   }
   async run(work) {
     if (this.controller || this.closed) return;
+    const doc = this.input.ownerDocument;
+    const origin = doc.activeElement;
+    const restoreComposerFocus = origin === this.input || origin === this.sendButton;
     const controller = new AbortController(); this.controller = controller;
     for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = true;
     this.sendButton.textContent = '停止'; this.sendButton.title = '停止当前操作'; this.uploadButton.disabled = true; this.compressButton.disabled = true; this.effortSelect.disabled = true;
-    this.conversationSelect.disabled = true; this.newConversationButton.disabled = true; this.renameConversationButton.disabled = true;
+    this.conversationSelect.disabled = true; this.newConversationButton.disabled = true; this.renameConversationButton.disabled = true; this.notebookAttach.disabled = true;
     try { await work(controller.signal); }
     catch (error) {
       if (this.controller === controller && !this.closed) {
@@ -774,7 +867,10 @@ class ChatView extends ItemView {
       if (this.controller === controller) {
         this.controller = null;
         for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = false;
-        if (!this.closed) { this.refreshStats(); this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.conversationSelect.disabled = false; this.newConversationButton.disabled = false; this.renameConversationButton.disabled = false; this.playback = null; }
+        if (!this.closed) {
+          this.refreshStats(); this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.conversationSelect.disabled = false; this.newConversationButton.disabled = false; this.renameConversationButton.disabled = false; this.notebookAttach.disabled = false; this.playback = null;
+          if (restoreComposerFocus) this.restoreComposerFocus(origin);
+        }
       }
     }
   }
@@ -806,21 +902,20 @@ class ChatView extends ItemView {
     if (!text || this.controller || this.closed) return;
     if (!this.plugin.keys.deepseek) { this.status.textContent = '请先填写 DeepSeek 密钥'; return; }
     const key = this.plugin.keys.deepseek; const model = this.plugin.model;
+    const notebookSendMode = this.notebookMode ? this.notebookAttach.value : 'none';
     await this.run(async signal => {
       this.hideMentions();
       const materials = [];
       const fullExpanded = await expandMentions(text, this.plugin.libraryPath, this.plugin.keys.mineru, signal, value => { if (!signal.aborted && !this.closed) this.status.textContent = value; }, parseFile, { materials, selectText: (body, name, format) => this.selectTextRange(body, name, signal, format) }); check(signal); this.libraryRecords = null;
       let notebookExtra = '', sentNotebookSnapshot = null;
       const refreshNotebookExtra = () => {
-        if (!this.notebookMode || !this.notebookAttach?.checked) return;
+        if (notebookSendMode === 'none') return;
         if (!this.notebookClient) throw Error('本轮要求附带 Notebook，但 RTC 尚未连接');
         this.reconcileNotebookSnapshot();
-        const delta = notebookDelta(this.notebookClient.read(), this.notebookSnapshot);
+        const delta = notebookDelta(this.notebookClient.read(), notebookSendMode === 'all' ? null : this.notebookSnapshot);
         notebookExtra = notebookContext(delta); sentNotebookSnapshot = delta.snapshot;
       };
-      if (this.notebookMode && this.notebookAttach?.checked) {
-        refreshNotebookExtra();
-      }
+      refreshNotebookExtra();
       const compose = () => (materials.length ? deduplicateMentions(text, materials, this.messages) : fullExpanded) + notebookExtra;
       let expanded = compose();
       const extra = estimateMessages([{role:'user',content:expanded}]);
@@ -923,10 +1018,11 @@ class ChatView extends ItemView {
     this.controller?.abort(); this.controller = null;
     this.disposeRows(); this.plugin.removeActiveConversation(); this.session = this.plugin.session; this.messages = this.session.messages; this.notebookSnapshot = null; delete this.session.notebookSnapshot; this.refreshNotebookDeltaLabel(); this.refreshStats(); this.feed.empty(); this.input.value = ''; this.status.textContent = '';
     for (const entry of this.session.entries) this.row(entry.label, entry.raw, entry); for (const state of this.rows) void this.render(state); this.refreshConversationOptions();
-    this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.playback = null;
+    this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.conversationSelect.disabled = false; this.newConversationButton.disabled = false; this.renameConversationButton.disabled = false; this.notebookAttach.disabled = false; this.playback = null;
+    this.restoreComposerFocus(null, true);
     void this.plugin.saveSession();
   }
-  async onClose() { this.hideMentions(); const shutdown = this.disconnectNotebook(); this.closed = true; this.localeObserver?.disconnect(); this.localeObserver = null; this.controller?.abort(); this.controller = null; clearTimeout(this.statsTimer); this.statsTimer = null; this.disposeRows(); this.virtualObserver?.disconnect(); this.virtualObserver = null; this.contentEl.empty(); await shutdown; await this.plugin.saveSession(); }
+  async onClose() { this.hideMentions(); const shutdown = this.disconnectNotebook(); this.closed = true; this.confirmationFinish?.(); this.input?.ownerDocument.defaultView?.removeEventListener('focus', this.windowFocusListener); this.windowFocusListener = null; this.pendingComposerFocus = false; this.pendingComposerFocusOrigin = null; this.localeObserver?.disconnect(); this.localeObserver = null; this.controller?.abort(); this.controller = null; clearTimeout(this.statsTimer); this.statsTimer = null; this.disposeRows(); this.virtualObserver?.disconnect(); this.virtualObserver = null; this.contentEl.empty(); await shutdown; await this.plugin.saveSession(); }
 }
 module.exports = class SimpleDeepSeek extends Plugin {
   notice(message) { return new Notice(translate(message, this.uiLanguage)); }
