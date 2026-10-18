@@ -26,16 +26,20 @@ function notebookLocation(value) {
   return { file: absolute, root: path.dirname(absolute), name: path.basename(absolute) };
 }
 
-async function ensureNotebook(location, io = fs) {
+async function ensureNotebook(location, io = fs, signal) {
+  checkCancelled(signal);
   await io.mkdir(location.root, { recursive: true });
+  checkCancelled(signal);
   try {
     const stat = await io.lstat(location.file);
+    checkCancelled(signal);
     if (!stat.isFile() || stat.isSymbolicLink()) throw Error('Notebook 路径不是普通文件');
     return false;
   } catch (error) { if (error.code !== 'ENOENT') throw error; }
+  checkCancelled(signal);
   const initial = { cells: [], metadata: {}, nbformat: 4, nbformat_minor: 5 };
-  try { await io.writeFile(location.file, JSON.stringify(initial, null, 2) + '\n', { flag: 'wx' }); return true; }
-  catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  try { await io.writeFile(location.file, JSON.stringify(initial, null, 2) + '\n', { flag: 'wx' }); checkCancelled(signal); return true; }
+  catch (error) { if (error.code === 'EEXIST') { checkCancelled(signal); return false; } throw error; }
 }
 
 async function jupyterExecutable(value, io = fs, platform = process.platform) {
@@ -69,12 +73,32 @@ async function freePort() {
   return port;
 }
 
-function probeServer(baseUrl, token, timeout = 1000) {
-  return new Promise(resolve => {
-    const request = http.get(baseUrl + '/api/status', { headers: { Authorization: `token ${token}` }, timeout }, response => {
-      response.resume(); response.on('end', () => resolve(response.statusCode === 200));
-    });
-    request.on('error', () => resolve(false)); request.on('timeout', () => { request.destroy(); resolve(false); });
+function probeServer(baseUrl, token, timeout = 1000, signal) {
+  return new Promise((resolve, reject) => {
+    let settled = false, request;
+    const finish = (value, error) => { if (settled) return; settled = true; clearTimeout(deadline); signal?.removeEventListener('abort', abort); request?.destroy(); error ? reject(error) : resolve(value); };
+    const abort = () => { try { checkCancelled(signal); } catch (error) { finish(false, error); } };
+    const deadline = setTimeout(() => finish(false), timeout);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    try {
+      request = http.get(baseUrl + '/api/status', { headers: { Authorization: `token ${token}` } }, response => {
+        response.resume(); response.on('end', () => finish(response.statusCode === 200)); response.on('error', () => finish(false)); response.on('close', () => finish(false));
+      });
+      request.on('error', () => finish(false));
+    } catch { finish(false); }
+  });
+}
+
+function probeReady(probe, baseUrl, token, signal, timeout = 1000) {
+  return new Promise((resolve, reject) => {
+    let settled = false; const controller = new AbortController();
+    const finish = (value, error) => { if (settled) return; settled = true; clearTimeout(deadline); signal?.removeEventListener('abort', abort); error ? reject(error) : resolve(value); };
+    const abort = () => { controller.abort(); try { checkCancelled(signal); } catch (error) { finish(false, error); } };
+    const deadline = setTimeout(() => { controller.abort(); finish(false); }, timeout);
+    signal?.addEventListener('abort', abort, { once: true });
+    if (signal?.aborted) { abort(); return; }
+    Promise.resolve().then(() => { checkCancelled(controller.signal); return probe(baseUrl, token, timeout, controller.signal); }).then(value => finish(!!value), error => finish(false, error));
   });
 }
 
@@ -83,8 +107,9 @@ async function startLocalJupyter({ executablePath, notebookFilePath, previous, s
   const location = notebookLocation(notebookFilePath);
   const executable = await jupyterExecutable(executablePath, io);
   checkCancelled(signal);
-  const created = await ensureNotebook(location, io);
-  if (previous?.root === location.root && previous?.baseUrl && previous?.token && await probe(previous.baseUrl, previous.token)) {
+  const created = await ensureNotebook(location, io, signal);
+  checkCancelled(signal);
+  if (previous?.root === location.root && previous?.baseUrl && previous?.token && await probeReady(probe, previous.baseUrl, previous.token, signal)) {
     checkCancelled(signal);
     return { ...location, executable, baseUrl: previous.baseUrl, token: previous.token, created, reused: true, browserUrl: `${previous.baseUrl}/lab/tree/${encodeURIComponent(location.name)}?token=${encodeURIComponent(previous.token)}` };
   }
@@ -97,20 +122,21 @@ async function startLocalJupyter({ executablePath, notebookFilePath, previous, s
   const child = spawnImpl(command.file, args, { cwd: location.root, env: { ...process.env, JUPYTER_TOKEN: token }, detached: process.platform !== 'win32', stdio: 'ignore', windowsHide: true });
   let launchError;
   child.once('error', error => { launchError = error; }); child.unref?.();
+  const assertStarted = () => { if (launchError || child.exitCode !== null || child.signalCode != null) throw Error('Jupyter 启动失败；请检查启动程序，以及同一环境中的 jupyterlab 和 jupyter-collaboration'); };
   try {
     const deadline = Date.now() + timeout;
     while (Date.now() < deadline) {
       checkCancelled(signal);
-      if (launchError || child.exitCode !== null) throw Error('Jupyter 启动失败；请检查启动程序，以及同一环境中的 jupyterlab 和 jupyter-collaboration');
-      if (await probe(baseUrl, token)) {
-        checkCancelled(signal);
+      assertStarted();
+      if (await probeReady(probe, baseUrl, token, signal, Math.min(1000, Math.max(1, deadline - Date.now())))) {
+        checkCancelled(signal); assertStarted();
         return { ...location, executable, baseUrl, token, child, created, reused: false, browserUrl: `${baseUrl}/lab/tree/${encodeURIComponent(location.name)}?token=${encodeURIComponent(token)}` };
       }
-      await wait(150, signal);
+      if (Date.now() < deadline) await wait(Math.min(150, deadline - Date.now()), signal);
     }
     throw Error('Jupyter 启动超时；请检查启动程序和协作扩展是否可用');
   } catch (error) {
-    child.kill?.();
+    if (child.exitCode === null && child.signalCode == null) child.kill?.();
     throw error;
   }
 }
@@ -124,7 +150,7 @@ async function stopLocalJupyter(local) {
       const done = () => { if (settled) return; settled = true; clearTimeout(deadline); resolve(); };
       const deadline = setTimeout(() => { request?.destroy(); done(); }, 5000);
       try {
-        request = http.request(local.baseUrl + '/api/shutdown', { method: 'POST', headers: { Authorization: `token ${local.token}` }, timeout: 2000 }, response => { response.resume(); response.on('end', done); });
+        request = http.request(local.baseUrl + '/api/shutdown', { method: 'POST', headers: { Authorization: `token ${local.token}` }, timeout: 2000 }, response => { response.resume(); for (const event of ['end', 'error', 'aborted', 'close']) response.once(event, done); });
         request.on('error', done); request.on('timeout', () => { request.destroy(); done(); }); request.end();
       } catch { done(); }
     });

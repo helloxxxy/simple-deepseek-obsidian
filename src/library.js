@@ -1,6 +1,8 @@
 const fs=require('node:fs/promises');const path=require('node:path');const {randomBytes,createHash}=require('node:crypto');
 const {request,check,pause,parseFile:parsePdf}=require('./core');const {flattenSource,MAX_TEX}=require('./arxiv-source');
 const {withOutlineContext}=require('./outline');
+const {stripImageDataUris}=require('./text-safety');
+const VERSION=require('../manifest.json').version;
 const DEFAULT_LIBRARY='';
 const LIBRARY_LOCK='.simple-deepseek-library.lock';
 const EMPTY_OVERVIEW=['','---','','### ARXIV','','---','','### BOOK','','---','','### OTHER PAPER','','---',''].join('\n');
@@ -104,7 +106,7 @@ function metadata(html,requested,Parser=globalThis.DOMParser){
 }
 
 let lastRequest=0;
-async function arxivGet(url,signal,http=request){await pause(Math.max(0,3000-(Date.now()-lastRequest)),signal);lastRequest=Date.now();try{return await http(url,{signal,maxBytes:200*1024*1024,headers:{'User-Agent':'Simple-DeepSeek/0.1.0 (single-paper import)'}});}catch(error){if(/HTTP 429/.test(error.message))throw Error('arXiv 请求受到限流（HTTP 429），请稍后重新发送');throw error;}}
+async function arxivGet(url,signal,http=request){await pause(Math.max(0,3000-(Date.now()-lastRequest)),signal);lastRequest=Date.now();try{return await http(url,{signal,maxBytes:200*1024*1024,headers:{'User-Agent':`Simple-DeepSeek/${VERSION} (single-paper import)`}});}catch(error){if(/HTTP 429/.test(error.message))throw Error('arXiv 请求受到限流（HTTP 429），请稍后重新发送');throw error;}}
 async function replaceLibraryText(stage,destination){
  const fresh=(await fs.readdir(stage)).filter(n=>n==='source.tex'||/^markdown_.*\.md$/i.test(n));if(fresh.length!==1)throw Error('新文献文本不唯一');
  const old=(await fs.readdir(destination)).filter(n=>n==='source.tex'||/^markdown_.*\.md$/i.test(n));
@@ -175,13 +177,13 @@ async function expandMentions(text,root,mineruKey,signal,notify,parseFile,option
   if(record.pdfFile&&record.mdFile&&record.pdfHash){raw=await readLimited(root,record.pdfFile,200*1024*1024);if(createHash('sha256').update(raw).digest('hex')!==record.pdfHash){notify('PDF 已变化，正在重新解析：'+id);inputFile=record.pdfFile;}}
   if(/\.pdf$/i.test(inputFile)){if(!record.indexed)throw Error('OVERVIEW.md 缺少该 PDF 的对应条目：'+record.id);if(!mineruKey)throw Error('该文献需要解析 PDF，请先填写 MinerU 密钥');raw=raw||await readLimited(root,inputFile,200*1024*1024);body=await parseFile({name:path.basename(inputFile),size:raw.length,arrayBuffer:async()=>raw.buffer.slice(raw.byteOffset,raw.byteOffset+raw.byteLength)},mineruKey,signal,notify);check(signal);const saved=await persistParsedPdf(root,{...record,pdfFile:inputFile},raw,body,signal);inputFile=saved.file;notify('PDF 解析结果已保存：'+path.relative(root,inputFile));}
   else body=(await readLimited(root,inputFile)).toString('utf8');
-  check(signal);if(options.selectText)body=await options.selectText(body,record.id+' · '+record.title,/\.tex$/i.test(inputFile)?'tex':'md');else if(/\.tex$/i.test(inputFile))body=withOutlineContext(body,body,[{start:0,end:body.length}]);check(signal);material.push('Reference ID: '+record.id+'\nTitle: '+record.title+'\nSource: '+path.relative(root,inputFile)+'\nReference text:\n\n'+body);
+  check(signal);body=stripImageDataUris(body);if(options.selectText)body=await options.selectText(body,record.id+' · '+record.title,/\.tex$/i.test(inputFile)?'tex':'md');else if(/\.tex$/i.test(inputFile))body=withOutlineContext(body,body,[{start:0,end:body.length}]);check(signal);material.push('Reference ID: '+record.id+'\nTitle: '+record.title+'\nSource: '+path.relative(root,inputFile)+'\nReference text:\n\n'+body);
  }
  if(options.materials)options.materials.push(...material);
  return text+'\n\n'+material.join('\n\n---\n\n');
 }
 function deduplicateMentions(text,materials,messages){
- const contains=(content,block)=>{let start=content.indexOf(block);while(start>=0){const end=start+block.length;if((start===0||content.slice(start-2,start)==='\n\n')&&(end===content.length||content.startsWith('\n\n---\n\nReference ID: ',end)))return true;start=content.indexOf(block,start+1);}return false;};
+ const contains=(content,block)=>{let start=content.indexOf(block);while(start>=0){const end=start+block.length;if((start===0||content.slice(start-2,start)==='\n\n')&&(end===content.length||content.startsWith('\n\n---\n\nReference ID: ',end)||/^\n\n\[(?:Notebook delta|Web reference sha256:|Web reference metadata\]|Image reference |Request context)/.test(content.slice(end))))return true;start=content.indexOf(block,start+1);}return false;};
  const remaining=materials.filter(block=>!messages.some(m=>m.role==='user'&&contains(m.content,block)));
  return remaining.length?text+'\n\n'+remaining.join('\n\n---\n\n'):text;
 }

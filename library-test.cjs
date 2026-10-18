@@ -1,5 +1,6 @@
 const {test}=require('node:test');const assert=require('node:assert/strict');const fs=require('node:fs/promises');const path=require('node:path');const {createHash}=require('node:crypto');const {gzipSync}=require('node:zlib');const {zipSync,strToU8}=require('fflate');const {JSDOM}=require('jsdom');const Parser=new JSDOM('').window.DOMParser;
 const lib=require('./src/library'),source=require('./src/arxiv-source');
+const {requestTimeContext}=require('./src/request-context');
 const baseOverview='\n---\n\n### ARXIV\n\n---\n\n#### 2001.00001 | Old\n\n> Old Author\n> \n> [[Old-2020-A.pdf|pdf]], [web](https://arxiv.org/abs/2001.00001), [[notes#Old|notes]]\n\n\n---\n\n### BOOK\n\n---\n\n#### 9780120831821 | Book\n\n> Book Author\n> [[Book.pdf|pdf]]\n\n---\n\n### OTHER PAPER\n\n---\n';
 const xml=id=>`<html><head><meta name="citation_arxiv_id" content="${id}"><meta name="citation_title" content="A &amp; B paper"><meta name="citation_author" content="Doe, Jane"><meta name="citation_pdf_url" content="https://arxiv.org/pdf/${id}"></head><body><a href="https://arxiv.org/abs/${id}v2">arXiv:${id}v2</a><a href="/src/${id}">TeX Source</a></body></html>`;
 
@@ -7,6 +8,11 @@ const tex='\\documentclass{article}\n\\title{Title}\n\\begin{document}\n\\input{
 const bundle=()=>Buffer.from(zipSync({'main.tex':strToU8(tex),'part.tex':strToU8('BODY')}));
 async function fixture(fn){const root=await fs.mkdtemp(path.join(__dirname,'library-test-'));try{await fs.mkdir(path.join(root,'arxiv'));await fs.mkdir(path.join(root,'book','9780120831821'),{recursive:true});await fs.mkdir(path.join(root,'otherpaper'));await fs.writeFile(path.join(root,'book','9780120831821','Book.pdf'),'%PDF-fake');await fs.writeFile(path.join(root,'OVERVIEW.md'),baseOverview);await fn(root);}finally{const resolved=await fs.realpath(root);if(path.dirname(resolved)!==await fs.realpath(__dirname)||!path.basename(resolved).startsWith('library-test-'))throw Error('Unsafe fixture cleanup');await fs.rm(resolved,{recursive:true});}}
 const signal=()=>new AbortController().signal;
+test('library dedup accepts Notebook, web, web-metadata and request-time context after a complete reference block',()=>{
+ const body='Reference ID: 2601.XXXXX\nTitle: Paper\nSource: arxiv/2601.XXXXX/source.tex\nReference text:\n\nFULL TEXT';
+ for(const suffix of ['\n\n[Notebook delta]\n{}','\n\n[Web reference sha256:'+'a'.repeat(64)+']\nURL: https://example.com\nTitle: Page\n\nWEB','\n\n[Web reference metadata]\n{"url":"https://example.com","retrieved_at":"2026-10-17T00:00:00.000Z"}',requestTimeContext({now:0,timeZone:'UTC'})])assert.equal(lib.deduplicateMentions('next',[body],[{role:'user',content:'first\n\n'+body+suffix}]),'next');
+ assert.equal(lib.deduplicateMentions('next',[body],[{role:'user',content:'first\n\n'+body+' changed'}]),'next\n\n'+body);
+});
 function fakeGet(id,src=bundle()){return async url=>url.includes('/abs/')?Buffer.from(xml(id)):url.includes('/src/')?src:Buffer.from('%PDF-test');}
 test('arxiv ids: normalize modern and historical URL forms; reject arbitrary hosts or DOI',()=>{
  assert.equal(lib.arxivId('arXiv:2101.12345'),'2101.12345');assert.equal(lib.arxivId('https://arxiv.org/pdf/cond-mat/0203193v2.pdf'),'cond-mat/0203193v2');for(const s of ['https://evil.test/pdf/2101.12345','../x','10.1234/a','9780120831821'])assert.throws(()=>lib.arxivId(s));
@@ -57,6 +63,23 @@ test('import: concurrent overview edit is incorporated before sorted insert',asy
 }));
 test('citation: direct TeX read, alias search, no network or duplicate within one message',async()=>fixture(async root=>{
  const dir=path.join(root,'arxiv','2001.00001');await fs.mkdir(dir);await fs.writeFile(path.join(dir,'Old-2020-A.pdf'),'%PDF-test');await fs.writeFile(path.join(dir,'source.tex'),'RAW TEX');const records=await lib.scanLibrary(root);assert.equal(lib.searchRecords(records,'Old')[0].id,'2001.00001');const result=await lib.expandMentions('Compare @[2001.00001v2] @[2001.00001v2]',root,'',signal(),()=>{},()=>assert.fail('not PDF'));assert.equal(result.split('RAW TEX').length,2);assert.equal(lib.mentions('email@example.com').length,0);
+}));
+
+test('library reference ingestion filters wrapped image data before selection while source files stay unchanged',async()=>fixture(async root=>{
+ const line='A'.repeat(76),payload='data:image/png;base64,'+Array(12).fill(line).concat('TQ==').join('\n  ');
+ const body='# Keep this section\n\n$x^2$ and \\[y=2\\]\n![figure](figures/plot.png)\n\n'+payload+'\n\nKeep ordinary prose and print("ready").';
+ const folder=path.join(root,'book','9780120831821'),markdown=path.join(folder,'markdown_Book.md');
+ await fs.writeFile(markdown,body);
+ const selected=[],materials=[];
+ const result=await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail('Markdown must not parse a PDF'),{materials,selectText:async text=>{selected.push(text);return text;}});
+ for(const value of [selected.join('\n'),materials.join('\n'),result,JSON.stringify({session:{messages:[{role:'user',content:result}]}})]){assert.ok(!value.includes(line));assert.ok(!value.includes('TQ=='));assert.ok(!value.includes('data:image/'));assert.ok(value.includes('![figure](figures/plot.png)'));assert.ok(value.includes('$x^2$'));assert.ok(value.includes('Keep ordinary prose'));}
+ assert.equal(await fs.readFile(markdown,'utf8'),body);
+ const texFolder=path.join(root,'arxiv','2001.00001');await fs.mkdir(texFolder);const texFile=path.join(texFolder,'source.tex');await fs.writeFile(texFile,body);
+ const texResult=await lib.expandMentions('@[2001.00001v2]',root,'',signal(),()=>{},()=>assert.fail('TeX must not parse a PDF'),{selectText:async(text,_name,format)=>{assert.equal(format,'tex');assert.ok(!text.includes(line));return text;}});
+ assert.ok(!texResult.includes(line));assert.equal(await fs.readFile(texFile,'utf8'),body);
+ await fs.unlink(markdown);const pdf=path.join(folder,'Book.pdf'),originalPdf=await fs.readFile(pdf);
+ const pdfResult=await lib.expandMentions('@[9780120831821]',root,'key',signal(),()=>{},async()=>body,{selectText:async text=>{assert.ok(!text.includes(line));return text;}});
+ assert.ok(!pdfResult.includes(line));assert.deepEqual(await fs.readFile(pdf),originalPdf);
 }));
 
 test('source: keeps independent supplements and original file markers without duplicating included children',()=>{

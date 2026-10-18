@@ -6,12 +6,12 @@
 
 ## 功能
 
-- 使用 Obsidian 原生 Markdown 和公式渲染。
-- 多对话存档、上下文占用与缓存命中统计；可手动压缩上下文，接近 80 万 tokens 时也会自动压缩。
-- 选择、拖入或粘贴图片与 PDF。图片走 DeepSeek Flash 原生识图，PDF 走 MinerU。图片字节只用于当次识图请求，后续对话只携带识别文字。
-- 可选的 `@` 本地文献库引用，包括 arXiv 源码获取与 PDF 转 Markdown。
-- 可选的 Notebook 模式：启动本地 JupyterLab、在 Obsidian 中查看单元格、通过 RTC 双向同步、运行单元格，并在笔记本同目录输出纯文本 `result.json`。
-- Notebook 对话每轮可选不发送、发送增量（默认）或发送全部单元格源码与文字输出。
+- 使用 Obsidian 原生 Markdown 和公式渲染，选取局部内容可复制为 Markdown。
+- 保存、重命名和切换多个对话，查看上下文占用与缓存命中统计；可手动压缩上下文，接近 80 万 tokens 时自动压缩。
+- 选择、拖入或粘贴图片与 PDF：DeepSeek Flash 负责识图，MinerU 提取 PDF 文字。
+- 使用 `@` 引用本地文献库，并支持 arXiv 论文入库。
+- 使用同一 DeepSeek 密钥搜索和读取公开网页。
+- 可选的本地 Jupyter Notebook 协作：预览单元格、同步修改、运行代码，并将文字输出保存为 `result.json`。
 - 协作编辑 Jupyter Notebook 时，请在运行前自行核对 AI 给出的代码。
 
 ## 安装
@@ -26,7 +26,15 @@
 
 ## 配置
 
-在「Keys and model settings」中填写 DeepSeek API Key；切换到中文后，该设置显示为「密钥与模型设置」。只有使用 PDF 解析或需要解析文献库 PDF 时才需要 MinerU Token。默认模型是 `deepseek-flash`，名称可修改。本地显示速度默认不限速，思考强度默认低。
+在 **Keys and model settings**（密钥与模型设置）中填写 DeepSeek API Key，解析 PDF 时另填 MinerU Token。默认模型是 `deepseek-flash`，名称可修改。本地显示速度默认不限速，思考强度默认低。
+
+修改模型后，下一次请求生效。可用时自动读取所选模型的上下文、输出和思考强度限制；无法获取模型信息时使用内置默认值。
+
+上下文使用率以 1,000,000 tokens 为显示基准。压缩会用摘要替换后续发送给模型的上下文，界面和存档仍保留原始对话。
+
+网页引用可写为 `@[https://example.com/page]`，也可直接让模型搜索。**Search / Fetch** 默认开启；关闭后从下一条消息起停止新的网页请求，显式引用按普通网址处理，此前的引用仍会保留。网页链接默认折叠，读取的文字进入隐藏上下文。[Search、Fetch 按成功请求计费](https://api-docs.deepseek.com/zh-cn/guides/search/)，网页文字也会计入模型输入。
+
+## Notebook
 
 Notebook 模式需要在同一 Python 环境中安装 JupyterLab、实时协作扩展和 Kernel：
 
@@ -34,16 +42,32 @@ Notebook 模式需要在同一 Python 环境中安装 JupyterLab、实时协作�
 python -m pip install jupyterlab jupyter-collaboration ipykernel
 ```
 
-之后在插件中填写该环境的 Jupyter 启动程序完整路径，以及目标 `.ipynb` 文件完整路径。文件不存在时插件会新建；Jupyter 仅监听本机 `127.0.0.1`，并在系统默认浏览器打开该笔记本。
+之后在插件中填写该环境的 Jupyter 启动程序完整路径，以及目标 `.ipynb` 文件完整路径。文件不存在时插件会新建；Jupyter 仅监听本机 `127.0.0.1`，并在系统默认浏览器打开该笔记本。关闭 Notebook 模式只停止该面板启动的 Jupyter，不会停止复用的现有服务。
+
+每轮可选不发送 Notebook 内容、发送增量（默认）或发送全部单元格源码与文字输出。AI 准备修改时，你仍可编辑和运行笔记本。
+
+关闭 Notebook 模式或选择「不发」时，本轮不提供 Notebook 读取和编辑工具，此前已发送的文字仍在上下文中。
+
+点击「检查并应用 Notebook 修改」，确认后才通过 RTC 写入。应用修改不会运行代码；有冲突的修改会被阻止，可基于最新笔记本重新生成。
+
+「全量运行」会重启 Kernel、清除旧输出并从头运行；成功完成后，可将该次运行的文字结果导出为 `result.json`。
+
+未完成的修改可在重新连接同一笔记本后「继续生成」，或「放弃暂存」并保留对话。无法恢复的任务需要重新生成。删除对话轮次可能使依赖它的待应用修改失效，不会撤销已经写入笔记本的修改。如果回复标为「已提交，未确认同步」，请先在 Jupyter 中核对实际内容；此时重复应用已禁用。
 
 ## 图片在哪些环节不会保留
 
-- 作为**图片文件**粘贴、拖入或选择的图片，会单独发给 DeepSeek 识别一次。后续对话只使用隐藏的识别文字；图片字节不会存入对话记录，也不会随每轮对话重发。
-- PDF 交给 MinerU 后，插件只读取结果包里的 `full.md`，不保留解析产生的图片文件。超过 200 页而分批处理的 PDF，以及没有 TeX 源码而回退为 PDF 的 arXiv 论文，也是如此。直接在聊天里上传 PDF 只会在该对话输出并保存 Markdown，不会自动加入文献库。
-- 文献库中的 `source.tex` 只按文本展开，不读取它引用的插图文件；Markdown 只按文本读取，不追踪其中的图片链接。库内 PDF 解析后保存的是 Markdown 文字，不另外保存图集。
-- Notebook 增量包含单元格源码和文字输出；源码中的图片 data URI 与长段 base64 类字符串会被遮蔽，图片、SVG、附件及 widget 输出会在本地过滤。`result.json` 只保存过滤后的文字输出，不包含单元格源码。原始 Notebook 文件不因此修改，插件也不会让 AI 读取其中的图片。
+附加的图片在发送时结合问题一起识别，识别文字进入隐藏上下文；需要细节时，模型可重看仍可用的原图或局部。识图独立于 **Search / Fetch**，并计入用量统计。
 
-如果问题依赖图表、示意图或 Notebook 输出的图片，请把那张图片或截图单独上传。PDF 解析文字即使提到了图，也不能代替模型实际看图。
+原图共用一个 128 MiB 的内存缓存，切换或清空会话、关闭面板时释放，空间不足时也可能被淘汰。原图不可用时需重新附加。上传原图的字节及其 Base64 编码不写入会话文件或普通文字上下文。
+
+以下读取环节只提供文字，不会自动识别其中的图片：
+
+- **PDF：** 保留 MinerU 提取的文字，不保留解析图片文件，过滤内嵌图片数据；长 PDF 与 arXiv PDF 入库也遵循此规则。聊天上传的 PDF 不会自动加入文献库。
+- **文献库 TeX 和 Markdown：** 不读取插图文件或图片链接，引用文字中的内嵌图片数据会被过滤，源文件保持原样。
+- **网页：** Search、Fetch 提供文字，过滤内嵌图片数据。
+- **Notebook：** 只将单元格源码和文字输出加入上下文。源码中的内嵌图片数据会被过滤，图片与 SVG 输出、附件和 widget 不进入上下文。`result.json` 包含过滤后的文字输出，不含单元格源码。过滤不会修改原始笔记本。
+
+需要 AI 看图时，请单独上传图片或截图。
 
 ## 文献库规范
 
@@ -69,14 +93,21 @@ python -m pip install jupyterlab jupyter-collaboration ipykernel
 > [web](https://arxiv.org/abs/2601.XXXXX)
 ```
 
-对话里用 `@[编号]` 引用；候选也可按标题和作者搜索。引用的正文进入 AI 上下文，但不在聊天记录界面显示。arXiv 同时接受现代数字编号与旧式 `分类/编号`，文件夹用不带版本的编号，旧式编号中的 `/` 换为 `_`。正文优先使用 `source.tex`；否则应只有一份 `markdown_*.md`。两者都没有时，有索引且唯一的 PDF 可经 MinerU 解析，文字 Markdown 保存在 PDF 旁边。解析 PDF 后，插件在 overview 条目里写入不可见的 `<!-- pdf-sha256: ... -->` 注释；PDF 内容变化时重新解析。arXiv 文本版本用不可见的 `<!-- arxiv-version: ... -->` 注释记录。这些注释不影响正常渲染。自动入库的 arXiv 条目按编号对应的日期顺序插入，不重写 BOOK 或 OTHER PAPER 分区。
+对话里用 `@[编号]` 引用，候选也可按标题和作者搜索；引用文字进入隐藏上下文。arXiv 接受数字编号与旧式 `分类/编号`，文件夹使用不带版本的编号，并将 `/` 换为 `_`。
 
-自动入库**只支持 arXiv**：输入本地不存在的 `@[arXiv 编号]` 时优先获取 TeX；没有可用源码才下载 arXiv PDF 转 Markdown，入库后只保留文字文件。不带版本的 arXiv 引用会检查文本新版本；已是最新版或无法联网时，若本地已有可用文字文件就直接复用。ISBN 和 DOI 只读取你自行维护的现有条目。长文进入上下文前可选取范围；能识别目录的 TeX 可按章节选择。
+arXiv 条目优先使用 `source.tex`，否则读取唯一的 `markdown_*.md`；书籍和其他论文条目也使用唯一的 `markdown_*.md`。没有合适文字文件时，有索引且唯一的 PDF 可经 MinerU 解析，Markdown 保存在 PDF 旁边。overview 用 HTML 注释维护 arXiv 版本和 PDF 哈希，PDF 变化时可重新解析。新 arXiv 条目按编号对应日期排序。
+
+自动入库**只支持 arXiv**：未知的 `@[arXiv 编号]` 优先获取 TeX，否则将 PDF 转为 Markdown 并仅保留文字文件。不带版本的引用会检查更新；本地已是最新版或离线时复用已有文字。ISBN 和 DOI 引用使用库内现有条目。超过约 100k tokens 的引用可选发送范围，能识别标题的 TeX 可按章节选择。
 
 ## 隐私与存储
 
-API 密钥和各电脑自己的路径使用操作系统账户的安全存储加密，放在笔记库之外。对话原文、思考内容及隐藏的图片/文档识别文字以**明文 JSON** 保存在 `<笔记库>/.obsidian/plugins/simple-deepseek/conversations/`；自定义对话名称以明文保存在同一插件目录的 `data.json`。这些内容会随笔记库同步。请勿把包含它们的笔记库直接公开。
+- API 密钥和各电脑自己的路径使用操作系统账户的安全存储加密，保存在笔记库之外，不写入共享的 `.obsidian` 配置。
+- 对话原文、思考、隐藏引用、原始工具交互及可恢复的 Notebook 任务（含单元格源码与过滤后的文字输出）以**明文 JSON** 保存在 `<笔记库>/.obsidian/plugins/simple-deepseek/conversations/`，会随笔记库同步。清空会话会将文件移入系统回收站；还原文件并重载插件即可恢复。
+- 共享设置和对话名称保存在 `data.json`，重命名对话不改变 JSON 文件名。
+- 聊天、识图与网页请求发往 DeepSeek，PDF 发往 MinerU，arXiv 入库会访问 arxiv.org。启用工具的请求会将此前的思考与工具交互计入上下文和用量。Jupyter 连接仅在本机进行。
+- Obsidian 可能加载已显示 Markdown 中的外部图片，这些图片不会自动加入 AI 上下文。
+- 插件没有遥测或独立本地日志。
 
-用户指定的文献库、Jupyter 启动程序和 Notebook 可以在笔记库之外。聊天与图片识别请求发往 DeepSeek，PDF 发往 MinerU，arXiv 引用会访问 arxiv.org。插件没有遥测或独立本地日志。具体数据流见 [PRIVACY.md](PRIVACY.md)。
+完整数据流与存储说明见 [PRIVACY.md](PRIVACY.md)。
 
 项目采用 [MIT 许可证](LICENSE)，所用依赖的声明见 [THIRD-PARTY-LICENSE.txt](THIRD-PARTY-LICENSE.txt)。

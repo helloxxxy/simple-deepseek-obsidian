@@ -1,5 +1,4 @@
-// Normalize explicitly delimited math while keeping Markdown code and links intact.
-function normalizeMath(markdown) {
+function normalizeMath(markdown, onMath) {
   const protectedParts = [];
   let marker = '\u0000SD';
   while (markdown.includes(marker)) marker += '_';
@@ -53,11 +52,18 @@ function normalizeMath(markdown) {
     const invalid = !inner.trim() || inner.includes(marker) || (open === '$' && (/^\s|\s$|\n/.test(inner) || /^\d/.test(text.slice(end+1))));
     if (invalid) { out += text.slice(i, i + open.length); i += open.length; continue; }
     const delimiter = open === '\\[' ? '$$' : '$';
-    out += open === '$$' || open === '$' ? text.slice(i, end + close.length) : delimiter + inner.trim() + delimiter;
+    const normalized = open === '$$' || open === '$' ? text.slice(i, end + close.length) : delimiter + inner.trim() + delimiter;
+    if (onMath) onMath(normalized);
+    out += normalized;
     i = end + close.length;
   }
   const token = new RegExp(marker + '(\\d+)\u0000', 'g');
   while (out.includes(marker)) out = out.replace(token, (_, i) => protectedParts[Number(i)]);
   return out;
 }
-module.exports = { normalizeMath };
+function mathExpressions(markdown) {
+  const expressions = [];
+  normalizeMath(markdown, expression => expressions.push(expression));
+  return expressions;
+}
+module.exports = { normalizeMath, mathExpressions };

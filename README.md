@@ -6,12 +6,12 @@ A desktop-only Obsidian plugin for DeepSeek conversations, PDF extraction with M
 
 ## Features
 
-- Render Markdown and math with Obsidian's renderer.
-- Keep multiple conversations in separate files. Show context usage and DeepSeek's reported cache-hit rate. Compress on demand or when context approaches 800,000 tokens.
-- Paste, select, or drag images and PDFs into the chat. Uploaded images use DeepSeek Flash vision; PDFs use MinerU. Image bytes are sent only in the one vision request, while its text description can be used in later turns.
-- Optionally reference a local paper library with `@`, including arXiv source retrieval and PDF-to-Markdown fallback.
-- In Notebook mode, launch a local JupyterLab server, show notebook cells in Obsidian, exchange changes through Jupyter RTC, run cells, and export a text-only `result.json` beside the notebook.
-- For each Notebook turn, send no notebook content, only changes (the default), or all cell source and text outputs.
+- Render Markdown and math with Obsidian's renderer, and copy selected passages as Markdown.
+- Save, rename, and switch between conversations. View context usage and cache-hit statistics; compress context manually or automatically near 800,000 tokens.
+- Paste, select, or drag images and PDFs into chat. DeepSeek Flash recognizes images; MinerU extracts PDF text.
+- Reference a local paper library with `@` and import arXiv papers.
+- Search and read public web pages with the same DeepSeek API key.
+- Optionally collaborate on a local Jupyter notebook: preview cells, synchronize edits, run code, and export text outputs to `result.json`.
 - When collaborating on a Jupyter notebook, review AI-generated code yourself before running it.
 
 ## Install
@@ -26,7 +26,15 @@ For manual installation:
 
 ## Configure
 
-Open the plugin panel from the ribbon or the **Open chat** command. Enter your DeepSeek API key in **Keys and model settings**. A MinerU token is needed only for PDF parsing and PDF-based library references. The model name is editable; the default is `deepseek-flash`. Local display speed defaults to unlimited and reasoning effort to low.
+Open the plugin panel from the ribbon or the **Open chat** command. Enter your DeepSeek API key in **Keys and model settings**, and add a MinerU token for PDF parsing. The model name is editable; the default is `deepseek-flash`. Local display speed defaults to unlimited and reasoning effort to low.
+
+Model changes take effect on the next request. The selected model's context window, output limit, and supported reasoning levels are read automatically when available; built-in defaults are used when model information is unavailable.
+
+The context meter uses 1,000,000 tokens as its display baseline. Compression replaces the context sent to the model with a summary while keeping the original conversation in chat and its archive.
+
+For web references, write `@[https://example.com/page]` or ask the model to search. **Search / Fetch** is enabled by default; turning it off disables new web requests from the next message and treats explicit references as ordinary URLs. Existing references remain available. Page links are collapsed by default, while retrieved text is kept in hidden context. [Search and Fetch are charged per successful request](https://api-docs.deepseek.com/guides/search/); retrieved text also counts as model input.
+
+## Notebook
 
 Notebook mode is optional. Install `jupyterlab`, `jupyter-collaboration`, and `ipykernel` into the **same Python environment**. Enter the full path to that environment's Jupyter launcher and the full path to a `.ipynb` file. The plugin creates the notebook if absent, starts Jupyter bound to `127.0.0.1`, and opens the notebook in your default browser. Closing Notebook mode stops only a Jupyter process launched by that panel; it will not stop an existing server it reused.
 
@@ -34,14 +42,30 @@ Notebook mode is optional. Install `jupyterlab`, `jupyter-collaboration`, and `i
 python -m pip install jupyterlab jupyter-collaboration ipykernel
 ```
 
+Each turn can include no notebook content, only changes (the default), or all cell source and text outputs. You can keep editing and running the notebook while the AI prepares changes.
+
+When Notebook mode is off or **Do not send** is selected, Notebook read and edit tools are unavailable for that turn. Previously shared text remains in context.
+
+Choose **Review and apply Notebook edits** to review proposed changes before they are written through RTC. Applying edits does not run the code. Conflicting edits are blocked and can be regenerated from the latest notebook.
+
+**Run all** restarts the kernel, clears old outputs, and reruns the notebook. After it succeeds, export that run's text results to `result.json`.
+
+Unfinished edits can be resumed after reconnecting the same notebook, or discarded while keeping the conversation. If a task cannot be restored, regenerate it. Deleting chat turns can invalidate dependent pending edits; it does not undo changes already applied to the notebook. If a reply is marked **Submitted; synchronization unconfirmed**, check the notebook in Jupyter before proceeding; repeat application is disabled.
+
 ## Images in documents and notebooks
 
-- An image pasted, dragged, or selected **as an image** is sent once to DeepSeek for visual description. Later turns use the description as hidden text context; the image bytes are not saved in the conversation or sent again.
-- A PDF is converted through MinerU, but the plugin reads only `full.md` from the result package. It does not retain extracted image files. This also applies when a long PDF is split into batches and when an arXiv PDF is used because TeX source is unavailable. A PDF uploaded directly in chat yields Markdown in that conversation; it is not automatically added to the paper library.
-- A library `source.tex` is flattened as text; referenced figure files are not loaded. A library Markdown file is read as text; image links in it are not followed. If a library PDF is parsed, the saved Markdown contains text, not a separate figure collection.
-- Notebook context includes cell source and text outputs; image data URIs and long base64-like strings in source are redacted. Image and SVG outputs, cell attachments, and widgets are filtered locally. `result.json` contains the filtered text outputs, not the cell source. The original notebook remains unchanged, and the plugin does not ask the AI to inspect its images.
+Attached images wait until Send and are examined together with your question. Recognition text enters hidden context; the model can reread an available original or crop. Image requests work independently of **Search / Fetch** and are included in usage statistics.
 
-If a chart, diagram, or notebook output image matters to your question, upload that image or a screenshot separately. Text extracted from a PDF may mention a figure, but it is not a substitute for viewing the figure.
+Originals share a 128 MiB in-memory cache and are released when you switch or clear a conversation or close the panel. An original may also be evicted when space is needed. Attach it again if it is no longer available. Uploaded image bytes and their Base64 encoding are not saved in conversation files or ordinary text context.
+
+These readers provide text without automatically recognizing their images:
+
+- **PDFs:** MinerU text is retained; extracted image files are not kept, and embedded image data is filtered. This also applies to long PDFs and arXiv PDF imports. A PDF uploaded in chat is not automatically added to the paper library.
+- **Library TeX and Markdown:** figure files and image links are not followed; embedded image data is removed from the reference text without changing the source file.
+- **Web pages:** Search and Fetch provide text, with embedded image data removed.
+- **Notebooks:** only cell source and text outputs enter context. Embedded image data is filtered from source; image and SVG outputs, attachments, and widgets are excluded. `result.json` contains filtered text outputs without cell source. This filtering does not modify the original notebook.
+
+Upload a figure or screenshot separately when you want the AI to inspect it.
 
 ## Paper library format
 
@@ -67,21 +91,22 @@ Set the paper-library path yourself in **Keys and model settings**; no location 
 > [web](https://arxiv.org/abs/2601.XXXXX)
 ```
 
-Use `@[identifier]` in chat to reference a library item; suggestions can also match its title and authors. The referenced text enters AI context without being shown in the chat transcript. For arXiv, both current numeric IDs and older `category/number` IDs are accepted. The folder uses the versionless ID, replacing `/` with `_` for older IDs. The preferred text is `source.tex`; otherwise keep exactly one `markdown_*.md`. If neither exists, a single indexed PDF can be parsed with MinerU and its Markdown saved beside the PDF. A PDF hash is recorded in an invisible `<!-- pdf-sha256: ... -->` comment in the overview, and a changed PDF is parsed again. Imported arXiv text versions use an invisible `<!-- arxiv-version: ... -->` comment. These comments do not change the rendered overview. Automatic arXiv entries are inserted in identifier date order without rewriting the book or other-paper sections.
+Use `@[identifier]` in chat; suggestions also match titles and authors. Referenced text enters hidden context. arXiv accepts numeric IDs and older `category/number` IDs; folders use the versionless ID with `/` replaced by `_`.
 
-Only arXiv IDs can be imported automatically: an unknown `@[arXiv ID]` fetches TeX when available, otherwise converts the arXiv PDF to Markdown and keeps only that text file. An unversioned arXiv reference checks for a newer text version; if the local version is current or the network is unavailable, an existing usable local text file is reused. Book ISBNs and other-paper DOIs are read from items you maintain in the library. Large text files prompt you to select a range or, for recognized TeX sections, select chapters before the text enters context.
+For arXiv entries, `source.tex` takes priority over a single `markdown_*.md`; book and other-paper entries use a single `markdown_*.md`. If no suitable text exists, a single indexed PDF can be parsed with MinerU and its Markdown saved beside it. The overview keeps arXiv versions and PDF hashes in HTML comments, so changed PDFs can be parsed again. New arXiv entries are sorted by identifier date.
+
+Automatic import supports arXiv only: an unknown `@[arXiv ID]` fetches TeX when available, otherwise converts the PDF to Markdown and keeps only the text file. Unversioned references check for updates and reuse available local text when current or offline. ISBN and DOI references use existing library entries. References over about 100k tokens offer range selection, or chapter selection for recognized TeX headings.
 
 ## Data and network access
 
 - API keys and machine-specific paths are encrypted with the current OS user's secure storage and kept outside the vault. They are not written to the shared `.obsidian` configuration.
-- Conversation text, thinking text, and hidden extracted text are stored as **plain JSON** in `<vault>/.obsidian/plugins/simple-deepseek/conversations/`. If you sync or publish the vault, those files travel with it. Clear a conversation in the plugin to remove its saved file.
-- Custom conversation names are stored as plain text in the shared `<vault>/.obsidian/plugins/simple-deepseek/data.json`; renaming does not change a conversation file's name or message content.
-- Manually uploaded images go to the DeepSeek API for vision processing. Image base64 is never added to later text messages or the conversation archive. Notebook output images are not automatically sent to AI.
-- PDFs go to MinerU. Local arXiv references may contact arxiv.org and download source or PDF files. The Jupyter connection stays on the local machine.
-- The paper-library directory, Jupyter executable, and notebook file are user-chosen paths that can be **outside the Obsidian vault**. The plugin reads and writes those paths only for the corresponding feature.
+- Conversation text, thinking, hidden references, original tool interactions, and restorable Notebook tasks (including cell source and filtered text outputs) are stored as **plain JSON** in `<vault>/.obsidian/plugins/simple-deepseek/conversations/` and travel with vault sync. Clearing a conversation moves its file to the system trash; restore the file and reload the plugin to recover it.
+- Shared settings and conversation names are saved in `data.json`. Renaming a conversation keeps its JSON filename.
+- Chat, image recognition, and web requests go to DeepSeek; PDFs go to MinerU, and arXiv imports contact arxiv.org. Tool-enabled requests include earlier thinking and tool interactions in their context and token usage. Jupyter connections stay on the local machine.
+- Obsidian may load external images embedded in displayed Markdown from their own URLs. Those images are not automatically added to AI context.
 - There is no plugin telemetry or separate local log file.
 
-Read the full [privacy and data-flow disclosure](PRIVACY.md) before entering API keys. The plugin uses third-party packages; their license notices are in [THIRD-PARTY-LICENSE.txt](THIRD-PARTY-LICENSE.txt).
+See [PRIVACY.md](PRIVACY.md) for the full data flow and storage details.
 
 ## License
 

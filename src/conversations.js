@@ -1,6 +1,7 @@
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const { randomBytes } = require('node:crypto');
+const { validMessage } = require('./history');
 
 const MAX_CONVERSATION_BYTES = 64 * 1024 * 1024;
 const validId = id => typeof id === 'string' && /^conversation-[a-z0-9-]{8,120}$/i.test(id);
@@ -21,7 +22,7 @@ function resolveConversationDirectory(app, manifest = {}) {
   return path.join(plugin, 'conversations');
 }
 class ConversationStore {
-  constructor(directory) { this.directory = directory; }
+  constructor(directory, { trashFile } = {}) { this.directory = directory; this.trashFile = trashFile; }
   file(id) { if (!validId(id)) throw Error('对话编号无效'); return path.join(this.directory, id + '.json'); }
   async ensure() { await fs.mkdir(this.directory, { recursive: true }); const stat = await fs.lstat(this.directory); if (!stat.isDirectory() || stat.isSymbolicLink()) throw Error('对话记录路径不是安全目录'); }
   async readRecord(file, id) {
@@ -30,9 +31,9 @@ class ConversationStore {
     const parsed = JSON.parse(await fs.readFile(file, 'utf8'));
     if (parsed?.version !== 1 || parsed.id !== id || !Number.isFinite(parsed.createdAt) || parsed.createdAt < 0
       || !Array.isArray(parsed.session?.messages) || !Array.isArray(parsed.session?.entries)
-      || !parsed.session.messages.every(message => message && ['user', 'assistant', 'system'].includes(message.role) && typeof message.content === 'string')
+      || !parsed.session.messages.every(validMessage)
       || !parsed.session.entries.every(entry => entry && typeof entry.label === 'string' && typeof entry.raw === 'string')) throw Error('invalid');
-    return { id, createdAt: parsed.createdAt, session: parsed.session };
+    return { id, createdAt: parsed.createdAt, session: parsed.session, ...(typeof parsed.name === 'string' && parsed.name.trim() ? { name: parsed.name } : {}) };
   }
   async recoverInterruptedWrites() {
     const groups = new Map();
@@ -83,7 +84,7 @@ class ConversationStore {
   async save(item) {
     if (!validId(item?.id) || !Number.isFinite(item.createdAt) || item.createdAt < 0 || !item.session) throw Error('待保存的对话记录无效');
     await this.ensure(); const destination = this.file(item.id), stamp = Date.now();
-    const body = JSON.stringify({ version: 1, id: item.id, createdAt: item.createdAt, updatedAt: stamp, session: item.session }, null, 2) + '\n';
+    const body = JSON.stringify({ version: 1, id: item.id, createdAt: item.createdAt, updatedAt: stamp, session: item.session, ...(typeof item.name === 'string' && item.name.trim() ? { name: item.name } : {}) }, null, 2) + '\n';
     if (Buffer.byteLength(body, 'utf8') > MAX_CONVERSATION_BYTES) throw Error('对话记录文件过大，无法保存');
     const token = randomBytes(8).toString('hex'), temp = path.join(this.directory, '.' + item.id + '-' + token + '.tmp'), backup = path.join(this.directory, '.' + item.id + '-' + token + '.bak');
     let moved = false, installed = false;
@@ -98,8 +99,24 @@ class ConversationStore {
       throw error;
     } finally { await fs.unlink(temp).catch(() => {}); }
   }
-  async remove(id) { await this.ensure(); await fs.unlink(this.file(id)).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+  async remove(id) {
+    const file = this.file(id);
+    await this.ensure(); await this.recoverInterruptedWrites();
+    let stat;
+    try { stat = await fs.lstat(file); } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
+    if (!stat.isFile() || stat.isSymbolicLink()) throw Error('现有对话记录不是普通文件');
+    if (typeof this.trashFile !== 'function' || await this.trashFile(file) !== true) throw Error('系统回收站不可用，原会话已保留');
+    return true;
+  }
 }
-function createConversationStore(app, manifest) { return new ConversationStore(resolveConversationDirectory(app, manifest)); }
+function createConversationStore(app, manifest) {
+  const directory = resolveConversationDirectory(app, manifest), adapter = app.vault.adapter;
+  const vault = path.resolve(typeof adapter.getBasePath === 'function' ? adapter.getBasePath() : adapter.basePath);
+  return new ConversationStore(directory, { trashFile: async file => {
+    if (!inside(vault, file)) throw Error('对话记录路径超出当前笔记库');
+    if (typeof adapter.trashSystem !== 'function') return false;
+    return adapter.trashSystem(path.relative(vault, file).split(path.sep).join('/'));
+  } });
+}
 
 module.exports = { MAX_CONVERSATION_BYTES, validId, resolveConversationDirectory, ConversationStore, createConversationStore };

@@ -1,14 +1,15 @@
 {
   "name": "simple-deepseek-obsidian",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "author": "helloxxxy",
   "private": true,
   "description": "A desktop Obsidian plugin for DeepSeek chat, MinerU documents, and Jupyter notebooks.",
   "license": "MIT",
   "scripts": {
     "build": "node build.cjs",
-    "test": "node --test test.cjs library-test.cjs secrets-test.cjs conversations-test.cjs notebook-test.cjs jupyter-local-test.cjs clipboard-test.cjs",
-    "release:check": "node scripts/verify-release.cjs"
+    "test": "node --test test.cjs library-test.cjs secrets-test.cjs conversations-test.cjs notebook-test.cjs notebook-task-test.cjs notebook-merge-test.cjs notebook-rtc-merge-test.cjs notebook-execution-test.cjs jupyter-local-test.cjs clipboard-test.cjs selection-copy-test.cjs models-test.cjs vision-test.cjs image-memory-test.cjs image-context-test.cjs service-errors-test.cjs core-tools-test.cjs tool-turn-test.cjs web-test.cjs history-test.cjs context-mode-test.cjs prompts-test.cjs tool-protocol-test.cjs request-context-test.cjs thinking-view-test.cjs source-list-test.cjs notices-test.cjs release-test.cjs text-safety-test.cjs notebook-patch-view-test.cjs workflow-test.cjs turn-context-test.cjs notebook-lifecycle-test.cjs connection-workflow-test.cjs pacing-test.cjs optimization-workflow-test.cjs",
+    "release:check": "node scripts/verify-release.cjs",
+    "release:package": "node scripts/package-release.cjs"
   },
   "dependencies": {
     "@jupyter/ydoc": "^4.1.1",

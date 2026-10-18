@@ -2,7 +2,8 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { YNotebook } = require('@jupyter/ydoc');
 const notebookModule = process.env.NOTEBOOK_MODULE || './src/notebook';
-const { safeOutputs, safeNotebook, notebookHash, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, parsePatch, normalizeBaseUrl, encodeNotebookPath, requestUrlFetch, JupyterRtcClient, resultJson } = require(notebookModule);
+const { safeOutputs, safeNotebook, notebookHash, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, parsePatch, describePatch, validatePatch, NotebookEditBuffer, normalizeBaseUrl, encodeNotebookPath, requestUrlFetch, JupyterRtcClient, resultJson, hash } = require(notebookModule);
+const { NotebookPatchWorkspace } = require(notebookModule);
 
 const fixture = () => ({ nbformat: 4, nbformat_minor: 5, metadata: { kernelspec: { name: 'python3' } }, cells: [
   { id: 'intro', cell_type: 'markdown', metadata: {}, source: ['# Notebook\n', 'Explain the result.'], attachments: { hidden: { 'image/png': 'AAAA' } } },
@@ -29,6 +30,21 @@ test('embedded image data in cell source is omitted from AI context without edit
 test('safe Notebook error output accepts both Jupyter traceback arrays and archived plain text', () => {
   assert.equal(safeOutputs([{ output_type: 'error', ename: 'ValueError', evalue: 'bad', traceback: 'line 1\nline 2' }])[0].traceback, 'line 1\nline 2');
   assert.equal(safeOutputs([{ output_type: 'error', ename: 'ValueError', evalue: 'bad', traceback: ['line 1', 'line 2'] }])[0].traceback, 'line 1\nline 2');
+});
+
+test('Notebook stream and error text remove embedded image bytes without changing the file data', () => {
+  const payload = 'Q'.repeat(900), image = `data:image/png;base64,${payload}`;
+  const original = fixture(); original.cells[1].outputs = [
+    { output_type: 'stream', name: 'stdout', text: [`image: ${image}\n`, `binary: ${payload}\nvalue: 42`] },
+    { output_type: 'error', ename: image, evalue: `failed: ${image}`, traceback: [`line 1: ${payload}`, 'line 2: print(x)'] }
+  ];
+  const before = JSON.stringify(original), safe = safeNotebook(original), context = notebookContext(notebookDelta(original, null));
+  assert.equal(JSON.stringify(original), before);
+  for (const text of [JSON.stringify(safe), context, JSON.stringify(resultJson(original))]) {
+    assert.equal(text.includes(payload), false); assert.equal(text.includes('data:image/'), false);
+    assert.ok(text.includes('value: 42')); assert.ok(text.includes('line 2: print(x)'));
+    assert.ok(text.includes('[image data omitted]')); assert.ok(text.includes('[binary data omitted]'));
+  }
 });
 
 test('notebook incremental context sends only changed and removed cells', () => {
@@ -70,6 +86,108 @@ test('notebook patch parser is explicit and paths stay inside Jupyter root', () 
   assert.throws(() => encodeNotebookPath('/home/user/Untitled.ipynb'), /相对于 Jupyter 根目录/);
 });
 
+test('Notebook patch parser preserves fenced source strings and accepts complete JSON objects', () => {
+  const value = { baseHash: 'b'.repeat(64), operations: [{ type: 'insert_cell', cellType: 'markdown', source: '# Notes\n```python\nprint({"value": "}"})\n```\n\\quoted\\' }] };
+  const json = JSON.stringify(value);
+  assert.deepEqual(parsePatch(`Explanation\n\`\`\`notebook-patch\n${json}\n\`\`\``), value);
+  assert.deepEqual(parsePatch(`~~~~json\n${json}\n~~~~`), value);
+  assert.deepEqual(parsePatch(`\`\`\`notebook-patch ${json}\`\`\``), value);
+  assert.deepEqual(parsePatch(json), value);
+  assert.deepEqual(parsePatch(value), value);
+  assert.throws(() => parsePatch(`\`\`\`notebook-patch\n${json.slice(0, -1)}\n\`\`\``), /JSON 无法解析/);
+  assert.throws(() => parsePatch(json.slice(0, -1)), /JSON 无法解析/);
+  assert.equal(parsePatch('{"other":true}'), null);
+});
+
+test('local Notebook replacements require an exact unique match and preserve literal replacement text', () => {
+  const original = fixture(), baseHash = notebookHash(original);
+  const patch = { baseHash, operations: [{ type: 'replace_text', cellId: 'calc', oldText: 'x = 2', newText: 'x = "$&"' }] };
+  const prepared = validatePatch(original, patch);
+  assert.equal(prepared.notebook.cells[1].source, 'x = "$&"\nx');
+  assert.equal(original.cells[1].source, 'x = 2\nx');
+  assert.match(describePatch(patch, 'en'), /Replace text/);
+  assert.throws(() => validatePatch(original, { baseHash, operations: [{ ...patch.operations[0], oldText: '' }] }), /非空 oldText/);
+  assert.throws(() => validatePatch(original, { baseHash, operations: [{ ...patch.operations[0], oldText: 'missing' }] }), /恰好匹配一次/);
+  assert.throws(() => validatePatch(original, { baseHash, operations: [{ ...patch.operations[0], oldText: 'x' }] }), /恰好匹配一次/);
+  assert.throws(() => validatePatch(original, { baseHash, operations: [{ ...patch.operations[0], sourceHash: hash('old source') }] }), /源码哈希不匹配/);
+  assert.throws(() => validatePatch(original, { baseHash, operations: [{ ...patch.operations[0], cellId: 'missing', index: 1 }] }), /找不到/);
+});
+
+test('invalid operations reject the whole RTC patch before any Yjs change', async () => {
+  const model = YNotebook.create({ data: fixture() }), client = new JupyterRtcClient({ baseUrl: 'http://127.0.0.1:8888', notebookPath: 'test.ipynb' });
+  client.socket = { synced: true, notebook: model }; client.verify = async () => assert.fail('invalid patch must not be sent');
+  const original = client.read(), baseHash = notebookHash(original);
+  await assert.rejects(client.applyPatch({ baseHash, operations: [{ type: 'set_source', cellId: 'calc', source: 'changed' }, { type: 'delete_cell', cellId: 'absent', index: 0 }] }), /找不到/);
+  assert.deepEqual(client.read(), original);
+  await assert.rejects(client.applyPatch({ baseHash, operations: [{ type: 'insert_cell', cellType: 'code', source: 'print(1)', index: 9 }] }), /位置无效/);
+  await assert.rejects(client.applyPatch({ baseHash, operations: [{ type: 'insert_cell', cellId: 'calc', cellType: 'code', source: 'print(1)' }] }), /ID 无效或重复/);
+  assert.deepEqual(client.read(), original); model.dispose();
+});
+
+test('Notebook edit batches use virtual hashes, keep insertion IDs, and leave failed batches unchanged', async () => {
+  const original = fixture(), buffer = new NotebookEditBuffer(original);
+  const first = buffer.stage({ baseHash: buffer.currentHash, operations: [{ type: 'insert_cell', cellType: 'code', source: 'y = 3' }], done: false });
+  const inserted = buffer.snapshot().cells[2]; assert.ok(inserted.id); assert.equal(first.currentHash, buffer.currentHash); assert.equal(buffer.done, false);
+  assert.throws(() => buffer.result(), /尚未完成/);
+  const snapshot = buffer.snapshot();
+  assert.throws(() => buffer.stage({ baseHash: buffer.currentHash, operations: [{ type: 'set_source', cellId: 'calc', source: 'not committed' }, { type: 'delete_cell', cellId: 'absent' }], done: true }), /找不到/);
+  assert.deepEqual(buffer.snapshot(), snapshot); assert.equal(buffer.done, false);
+  assert.throws(() => buffer.stage({ baseHash: notebookHash(original), operations: [], done: true }), /发生变化/);
+  buffer.stage({ baseHash: buffer.currentHash, operations: [{ type: 'replace_text', cellId: inserted.id, oldText: '3', newText: '4' }], done: true });
+  const patch = buffer.result(); assert.equal(patch.baseHash, notebookHash(original)); assert.equal(patch.operations.length, 2);
+  const model = YNotebook.create({ data: original }), client = new JupyterRtcClient({ baseUrl: 'http://127.0.0.1:8888', notebookPath: 'test.ipynb' });
+  client.socket = { synced: true, notebook: model }; client.verify = async () => {};
+  const applied = await client.applyPatch(patch);
+  assert.equal(applied.cells[2].id, inserted.id); assert.equal(notebookHash(applied), buffer.currentHash);
+  patch.operations[0].source = 'external mutation'; assert.equal(buffer.result().operations[0].source, 'y = 3');
+  const copy = buffer.read(); copy.cells.length = 0; assert.equal(buffer.snapshot().cells.length, 3);
+  assert.throws(() => buffer.stage({ baseHash: buffer.currentHash, operations: [] }), /已经完成/); model.dispose();
+});
+
+test('large new-cell chunks stay in memory and cannot become applicable until every chunk is complete', () => {
+  const original = fixture(), buffer = new NotebookEditBuffer(original), baseHash = buffer.currentHash;
+  assert.equal(buffer.status().started, false);
+  const operation = { type: 'insert_cell', cellType: 'code', index: 2 };
+  const first = buffer.stage({ baseHash, operations: [{ type: 'source_chunk', chunkId: 'large', part: 0, totalParts: 2, source: 'print("', operation }], done: false });
+  assert.equal(first.pendingChunks, 1); assert.equal(first.currentHash, baseHash); assert.equal(buffer.snapshot().cells.length, 2);
+  assert.equal(first.nextPart, 1); assert.equal(first.chunkId, 'large'); assert.equal(first.started, true);
+  assert.equal(JSON.stringify(buffer.status()).includes('print'), false);
+  assert.throws(() => buffer.result(), /尚未完成/);
+  assert.throws(() => buffer.stage({ baseHash, operations: [{ type: 'source_chunk', chunkId: 'large', part: 1, totalParts: 2, source: 'bad")' }, { type: 'delete_cell', cellId: 'absent' }], done: true }), /找不到/);
+  assert.equal(buffer.currentHash, baseHash); assert.equal(buffer.snapshot().cells.length, 2);
+  assert.throws(() => buffer.stage({ baseHash, operations: [{ type: 'source_chunk', chunkId: 'other', part: 1, totalParts: 2, source: 'bad' }], done: true }), /顺序或元数据/);
+  assert.throws(() => buffer.stage({ baseHash, operations: [], done: true }), /尚未收齐/);
+  assert.throws(() => buffer.stage({ baseHash, operations: [{ type: 'set_source', cellId: 'calc', source: 'bad' }], done: false }), /先收齐/);
+  const last = buffer.stage({ baseHash, operations: [{ type: 'source_chunk', chunkId: 'large', part: 1, totalParts: 2, source: 'ready")' }], done: true });
+  assert.equal(last.pendingChunks, 0); assert.equal(last.done, true);
+  const patch = buffer.result(); assert.equal(patch.operations.length, 1); assert.equal(patch.operations[0].source, 'print("ready")');
+  assert.equal(validatePatch(original, patch).notebook.cells[2].source, 'print("ready")');
+});
+
+test('Notebook chunks validate insertion targets on their first part and preserve older notebook hashes', async () => {
+  const original = fixture(), buffer = new NotebookEditBuffer(original);
+  assert.throws(() => buffer.stage({ baseHash: buffer.currentHash, operations: [{ type: 'source_chunk', chunkId: 'bad', part: 0, totalParts: 2, source: '', operation: { type: 'insert_cell', cellType: 'code', index: 99 } }], done: false }), /位置无效/);
+  assert.equal(buffer.currentHash, notebookHash(original));
+  const old = fixture(); old.nbformat_minor = 4; for (const cell of old.cells) delete cell.id;
+  const model = YNotebook.create({ data: old }), client = new JupyterRtcClient({ baseUrl: 'http://127.0.0.1:8888', notebookPath: 'test.ipynb' });
+  client.socket = { synced: true, notebook: model }; client.verify = async () => {};
+  const oldBuffer = new NotebookEditBuffer(client.read());
+  oldBuffer.stage({ baseHash: oldBuffer.currentHash, operations: [{ type: 'insert_cell', cellType: 'markdown', source: 'legacy schema', index: 2 }], done: true });
+  assert.equal(notebookHash(await client.applyPatch(oldBuffer.result())), oldBuffer.currentHash); model.dispose();
+});
+
+test('a completed source chunk can be finalized by an empty batch and result calls remain independent', () => {
+  const buffer = new NotebookEditBuffer(fixture());
+  buffer.stage({ baseHash: buffer.currentHash, operations: [{ type: 'source_chunk', chunkId: 'one', part: 0, totalParts: 1, source: '# Collected', operation: { type: 'insert_cell', cellType: 'markdown' } }], done: false });
+  assert.equal(buffer.status().pendingChunks, 0); assert.equal(buffer.done, false);
+  const hashBefore = buffer.currentHash;
+  buffer.stage({ baseHash: hashBefore, operations: [], done: true });
+  assert.equal(buffer.currentHash, hashBefore); assert.equal(buffer.done, true);
+  const first = buffer.result(), second = buffer.result(); assert.deepEqual(first, second); assert.notEqual(first, second);
+  first.operations[0].source = 'mutated'; assert.equal(buffer.result().operations[0].source, '# Collected');
+  assert.equal(buffer.stage({ baseHash: hashBefore, operations: [], done: true }).replayed, true);
+});
+
 test('Obsidian requestUrl adapter preserves authenticated REST requests and HTTP status', async () => {
   let sent;
   const fetchImpl = requestUrlFetch(async request => { sent = request; return { status: 201, json: { fileId: 'file-1', sessionId: 'session-1' } }; });
@@ -101,6 +219,58 @@ test('RTC patch checks the exact base hash and verifies server state before succ
 test('result.json contains safe text outputs from a completed snapshot', () => {
   const result = resultJson(fixture()), serialized = JSON.stringify(result);
   assert.equal(result.cells.length, 1); assert.ok(serialized.includes('text/plain')); assert.ok(!serialized.includes('image/png'));
+});
+
+test('Notebook delta reads source and outputs once per cell while retaining hash and snapshot compatibility', () => {
+  const original = fixture(); original.cells[0].source = ['# Unicode 数学\n', '![hidden](data:image/png;base64,QUJDRA==)'];
+  original.cells[1].outputs.push({ output_type: 'error', ename: 'ValueError', evalue: 'bad', traceback: ['first', 'second'] });
+  let sourceReads = 0, outputReads = 0;
+  const counted = { ...original, cells: original.cells.map(cell => ({ ...cell,
+    get source() { sourceReads++; return cell.source; }, get outputs() { outputReads++; return cell.outputs; }
+  })) };
+  const result = notebookDelta(counted, null);
+  assert.equal(sourceReads, original.cells.length); assert.equal(outputReads, original.cells.length);
+  assert.equal(result.currentHash, notebookHash(original)); assert.deepEqual(result.snapshot, notebookSnapshot(original));
+  assert.deepEqual(result.changed, safeNotebook(original).cells);
+  assert.ok(!JSON.stringify(result.changed).includes('data:image/')); assert.equal(original.cells[0].source[1], '![hidden](data:image/png;base64,QUJDRA==)');
+  const second = notebookDelta(original, result.snapshot); assert.deepEqual(second.changed, []); assert.deepEqual(second.removed, []);
+});
+
+test('Notebook projections and snapshots observe in-place source output and structural changes without stale caching', () => {
+  const notebook = fixture(), previous = notebookSnapshot(notebook), firstHash = previous.hash;
+  notebook.cells[1].source = 'x = 45'; notebook.cells[1].outputs[0].data['text/plain'] = '45';
+  const changed = notebookDelta(notebook, previous);
+  assert.notEqual(changed.currentHash, firstHash); assert.equal(changed.currentHash, notebookHash(notebook));
+  assert.equal(changed.changed[0].source, 'x = 45'); assert.equal(changed.changed[0].outputs[0].data['text/plain'], '45');
+  notebook.cells.unshift({ id: 'new', cell_type: 'raw', source: 'new source' });
+  assert.equal(safeNotebook(notebook).notebookHash, notebookHash(notebook)); assert.equal(notebookSnapshot(notebook).cells.calc.index, 2);
+});
+
+test('Notebook virtual operation index is reused for source edits and rebuilt after insertions or deletions', () => {
+  const workspace = new NotebookPatchWorkspace({ cells: Array.from({ length: 120 }, (_, index) => ({ id: 'cell-'+index, cell_type: 'code', source: 'original '+index, metadata: {}, outputs: [] })) });
+  let reads = 0;
+  for (const cell of workspace.notebook.cells) { const id = cell.id; Object.defineProperty(cell, 'id', { enumerable: true, get() { reads++; return id; } }); }
+  let initialReads;
+  for (let index = 0; index < 40; index++) {
+    const operation = workspace.apply({ type: 'set_source', cellId: 'cell-119', source: 'update '+index }); assert.equal(operation.index, 119);
+    if (index === 0) initialReads = reads;
+  }
+  assert.ok(initialReads >= 120); assert.equal(reads, initialReads); assert.equal(workspace.notebook.cells[119].source, 'update 39');
+  workspace.apply({ type: 'insert_cell', cellId: 'new-cell', index: 0, cellType: 'markdown', source: '# New' });
+  const moved = workspace.apply({ type: 'replace_text', cellId: 'cell-119', oldText: 'update 39', newText: 'moved update' });
+  assert.equal(moved.index, 120); assert.equal(reads, initialReads*2);
+  workspace.apply({ type: 'delete_cell', cellId: 'new-cell' });
+  assert.equal(workspace.apply({ type: 'set_source', cellId: 'cell-119', source: 'last' }).index, 119); assert.equal(reads, initialReads*3);
+});
+
+test('Notebook virtual operations preserve first matching duplicate IDs and reindex legacy fallback IDs', () => {
+  const duplicate = { cells: [{ id: 'same', cell_type: 'raw', source: 'first' }, { id: 'same', cell_type: 'raw', source: 'second' }] };
+  const workspace = new NotebookPatchWorkspace(duplicate); workspace.apply({ type: 'set_source', cellId: 'same', source: 'changed first' });
+  assert.equal(workspace.notebook.cells[0].source, 'changed first'); assert.equal(workspace.notebook.cells[1].source, 'second'); assert.equal(duplicate.cells[0].source, 'first');
+  workspace.apply({ type: 'delete_cell', cellId: 'same' }); assert.equal(workspace.apply({ type: 'set_source', cellId: 'same', source: 'remaining' }).index, 0);
+  const legacy = new NotebookPatchWorkspace({ nbformat: 4, nbformat_minor: 4, cells: [{ cell_type: 'raw', source: 'first' }, { cell_type: 'raw', source: 'second' }] });
+  assert.equal(legacy.indexForId('index-1'), 1); legacy.apply({ type: 'delete_cell', cellId: 'index-0' });
+  assert.equal(legacy.indexForId('index-1'), -1); assert.equal(legacy.apply({ type: 'set_source', cellId: 'index-0', source: 'remaining second' }).index, 0);
 });
 
 if (process.env.NOTEBOOK_MODULE) test('bundled RTC completes Jupyter-style sync and verifies through a second connection', async () => {

@@ -3,6 +3,11 @@ const FRAME_MS=16;
 // Display-only approximation. Never used to change API messages or billed usage.
 function charCost(codePoint){return codePoint<128?0.3:0.6;}
 function advance(text,start,credit,ended=false){
+  if(credit===Infinity){
+    const tail=text.charCodeAt(text.length-1);
+    const held=!ended&&tail>=0xd800&&tail<=0xdbff;
+    return{end:Math.max(start,text.length-(held?1:0)),credit};
+  }
   let end=start;
   while(end<text.length){
     const first=text.charCodeAt(end);

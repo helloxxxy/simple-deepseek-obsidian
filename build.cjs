@@ -1,7 +1,16 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const esbuild = require('esbuild');
+const { checkThirdPartyNotices } = require('./scripts/third-party-notices.cjs');
+const manifest = require('./manifest.json');
 const out = path.join(__dirname, 'dist', 'simple-deepseek');
+checkThirdPartyNotices(__dirname);
+const normalize = value => value.replace(/\r\n?/g, '\n');
+const notices = normalize(fs.readFileSync(path.join(__dirname,'THIRD-PARTY-LICENSE.txt'),'utf8'));
+const license = normalize(fs.readFileSync(path.join(__dirname,'LICENSE'),'utf8'));
+if ((license + notices).includes('*/')) throw Error('License text cannot close the JavaScript notice comment');
+const banner = `/*!\nSimple DeepSeek ${manifest.version}\n\n${license.trim()}\n\nThird-party notices\n\n${notices.trim()}\n*/`;
 fs.mkdirSync(out, {recursive:true});
-esbuild.buildSync({entryPoints:[path.join(__dirname,'src','main.js')],bundle:true,platform:'node',format:'cjs',external:['obsidian','electron'],outfile:path.join(out,'main.js')});
-for (const name of ['manifest.json','styles.css','THIRD-PARTY-LICENSE.txt']) fs.copyFileSync(path.join(__dirname,name),path.join(out,name));
+fs.rmSync(path.join(out,'THIRD-PARTY-LICENSE.txt'),{force:true});
+esbuild.buildSync({entryPoints:[path.join(__dirname,'src','main.js')],bundle:true,platform:'node',format:'cjs',external:['obsidian','electron'],banner:{js:banner},legalComments:'eof',outfile:path.join(out,'main.js')});
+for (const name of ['manifest.json','styles.css']) fs.writeFileSync(path.join(out,name),normalize(fs.readFileSync(path.join(__dirname,name),'utf8')));
