@@ -2,6 +2,49 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { ModelCatalog, modelCapabilities } = require('./src/models');
 
+test('Flash aliases use native web while Pro retains chat and standalone search', async () => {
+  const {ui} = require('./scripts/test-ui.cjs');
+  const requests = [];
+  const env = ui(async (_key, messages, _signal, onText, _http, options) => {
+    requests.push({model:options.model, tools:options.tools.map(tool => tool.function?.name || tool.type), prompt:messages[0].content});
+    onText('OK');
+    return {prompt_tokens:30,completion_tokens:2};
+  }, async () => '', {saved:{webEnabled:true,uiLanguage:'en'}});
+  await env.plugin.onload(); env.plugin.keys.deepseek = 'fake';
+  const view = env.plugin.factory({}); await view.onOpen();
+  for (const model of ['deepseek-v4-pro','deepseek-flash','deepseek-v4-flash','deepseek-v4-flash-vision-exp']) {
+    env.plugin.model = model; view.input.value = 'hello'; await view.send();
+    const request = requests.at(-1);
+    assert.equal(request.model,model);
+    assert.equal(request.prompt,view.requestPrompt());
+    assert.deepEqual(Array.from(request.tools),model === 'deepseek-v4-pro' ? ['search_web','fetch_page'] : ['deepseek_web_search','deepseek_read_url']);
+  }
+  await view.onClose();
+});
+
+test('Pro checks pending, library and historical file references before upload, generation and compression', async () => {
+  const {ui} = require('./scripts/test-ui.cjs');
+  const file = {name:'paper.pdf',size:4,arrayBuffer:async () => Buffer.from('test')};
+  const library = require('./src/library');
+  let chats = 0;
+  const env = ui(async () => { chats++; }, async () => '', {saved:{webEnabled:false,uiLanguage:'en',model:'deepseek-v4-pro'}, libraryApi:{...library,expandMentions:async (text,root,key,signal,notify,parse,options) => {
+    if (text.includes('@[paper]')) await options.onFile(file);
+    return text;
+  }}});
+  await env.plugin.onload(); env.plugin.keys.deepseek = 'fake';
+  const view = env.plugin.factory({}); await view.onOpen();
+  view.input.value = 'Read this'; await view.uploadFiles([file]); await view.send();
+  assert.match(view.status.textContent,/deepseek-flash/);
+  assert.equal(view.input.value,'Read this'); assert.equal(view.pendingFiles.length,1);
+  view.pendingFiles = []; view.input.value = '@[paper]'; await view.send();
+  assert.equal(view.input.value,'@[paper]'); assert.equal(env.fileUploads.length,0); assert.equal(view.messages.length,0);
+  view.messages.push({role:'user',content:[{type:'text',text:'Earlier attachment'},{type:'file',file_id:'file-api-prior'}]});
+  view.input.value = 'Follow up'; await view.send(); assert.equal(view.input.value,'Follow up');
+  await view.manualCompress(); assert.match(view.status.textContent,/deepseek-flash/);
+  assert.equal(view.messages.length,1); assert.equal(chats,0);
+  await view.onClose();
+});
+
 test('model metadata is cached in memory per key and expires', async () => {
   let now=0,calls=0;
   const catalog=new ModelCatalog({now:()=>now,ttlMs:100,fetchModels:async()=>{calls++;return{data:[{id:'custom',context_window:32768,max_output_tokens:4096,input_modalities:['text'],effort:{supported_levels:['low','high'],default_level:'low'}}]};}});

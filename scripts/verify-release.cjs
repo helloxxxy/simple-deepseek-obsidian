@@ -28,6 +28,8 @@ for (const name of assets) {
 assert.deepEqual(JSON.parse(fs.readFileSync(path.join(built, 'manifest.json'), 'utf8')), manifest);
 const normalize = text => text.replace(/\r\n?/g,'\n');
 assert.equal(fs.readFileSync(path.join(built,'styles.css'),'utf8'),normalize(fs.readFileSync(path.join(root,'styles.css'),'utf8')));
+const cssDeclarations = fs.readFileSync(path.join(root,'styles.css'),'utf8').replace(/\/\*[\s\S]*?\*\/|"(?:\\[\s\S]|[^"\\])*"|'(?:\\[\s\S]|[^'\\])*'/g,'');
+assert.ok(!/!\s*important\b/i.test(cssDeclarations),'Use scoped selector specificity instead of !important');
 checkThirdPartyNotices(root);
 const bundle = fs.readFileSync(path.join(built,'main.js'),'utf8');
 new vm.Script(bundle,{filename:'main.js'});

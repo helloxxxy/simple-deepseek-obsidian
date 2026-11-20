@@ -2,6 +2,16 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { webTools, WebReferences, extractWebMentions, referenceMarker, publicWebUrl, contentHash, MAX_RESPONSE_BYTES, MAX_CACHED_RESPONSES } = require('./src/web');
 const bytes = value => Buffer.from(JSON.stringify(value));
+
+test('web deduplication reads text parts alongside native files and observes in-place text changes', () => {
+  const {hasOriginal}=require('./src/web');
+  const content='Retrieved source body';
+  const hash=contentHash(content);
+  const messages=[{role:'user',content:[{type:'text',text:'Question\n\n[Web reference sha256:'+hash+']\n'+content},{type:'file',file_id:'file-api-example'}]}];
+  assert.equal(hasOriginal(messages,content,hash),true);
+  messages[0].content[0].text='Replaced reference';
+  assert.equal(hasOriginal(messages,content,hash),false);
+});
 const retrievedAt = '2026-10-17T14:14:10.932Z';
 const make = options => new WebReferences({ key: 'sk-test-key', now: () => Date.parse(retrievedAt), ...options });
 
@@ -224,4 +234,41 @@ test('web drops invalid source metadata and filters binary payloads in retained 
     assert.equal(retained.includes(image), false); assert.equal(retained.includes(binary), false); assert.equal(retained.includes('not retained'), false);
   }
   assert.match(result.results[0].site_name, /image data omitted/); assert.equal(result.results[1].site_name, undefined);
+});
+
+test('web original proof cache follows exact content, role and active-history membership',()=>{
+  const {hasOriginal}=require('./src/web');
+  const content='An exact original source.',hash=contentHash(content),message={role:'tool',content:JSON.stringify({hash,content})},messages=[message];
+  assert.equal(hasOriginal(messages,content,hash),true);
+  message.content=JSON.stringify({hash,content:'A forged summary instead.'});
+  assert.equal(hasOriginal(messages,content,hash),false);
+  message.content=JSON.stringify({hash,content});message.role='user';
+  assert.equal(hasOriginal(messages,content,hash),false);
+  message.role='tool';assert.equal(hasOriginal(messages,content,hash),true);
+  messages.splice(0,1,{role:'user',content:'Checkpoint: '+referenceMarker(hash)});
+  assert.equal(hasOriginal(messages,content,hash),false);
+  messages.push(message);assert.equal(hasOriginal(messages,content,hash),true);
+  messages.length=0;assert.equal(hasOriginal(messages,content,hash),false);
+  messages.push({role:'user',content:referenceMarker(hash)+'\n'+content});
+  assert.equal(hasOriginal(messages,content,hash),true);
+  messages[0].content=referenceMarker(hash)+'\nOnly a summary.';
+  assert.equal(hasOriginal(messages,content,hash),false);
+});
+
+test('web search parses each unchanged historical tool message only once while new and changed messages are revalidated',async()=>{
+  const existingMessages=Array.from({length:10},(_,index)=>{const content=('Historical reference '+index+' ').repeat(1000);return {role:'tool',content:JSON.stringify({hash:contentHash(content),content})};});
+  const results=Array.from({length:50},(_,index)=>({url:'https://example.com/'+index,content:'New source '+index}));
+  const web=make({existingMessages,http:async()=>bytes({results})}),parse=JSON.parse;
+  let historicalParses=0;
+  JSON.parse=function(text,...args){if(typeof text==='string'&&text.includes('Historical reference'))historicalParses++;return parse(text,...args);};
+  try {
+    await web.execute('search_web',{query:'fifty sources',count:50,need_content:true});
+    assert.equal(historicalParses,10);
+    existingMessages.push({role:'tool',content:JSON.stringify({content:'Historical reference appended',hash:contentHash('Historical reference appended')})});
+    await web.execute('search_web',{query:'fifty sources',count:50,need_content:true});
+    assert.equal(historicalParses,11,'Only the appended message needs parsing');
+    existingMessages[0].content=existingMessages[0].content.replace('Historical reference 0','Historical reference X');
+    await web.execute('search_web',{query:'fifty sources',count:50,need_content:true});
+    assert.equal(historicalParses,12,'A same-object content change must invalidate its proof');
+  } finally { JSON.parse=parse; }
 });

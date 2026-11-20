@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   SYSTEM_PROMPT, estimateText, estimateMessages, contextTokens,
-  rememberUsage, sessionStats, outputBudget, compactContext
+  rememberUsage, sessionStats, outputBudget, compactContext, requestInputTokens, contextReserve, COMPRESSION_PROMPT
 } = require('./src/context');
 
 const history = () => [
@@ -11,6 +11,47 @@ const history = () => [
   { role: 'tool', tool_call_id: 'fetch-1', content: '{"url":"https://example.com/source","content":"Original source text."}' },
   { role: 'assistant', content: 'The final explanation.', reasoning_content: 'Review the source once more.' }
 ];
+
+test('server multi-step billing is retained separately from estimated current context', () => {
+  const session={messages:[{role:'user',content:[{type:'text',text:'Read the document'},{type:'file',file_id:'file-api-example'}]},{role:'assistant',content:'Answer',server_tool_calls:[{index:0,calls:[{signature:'opaque'}]}]}]};
+  const usage={prompt_tokens:2000000,completion_tokens:3000};
+  const metadata={model:'deepseek-flash',systemPrompt:SYSTEM_PROMPT,aggregateUsage:true};
+  rememberUsage(session,usage,metadata);
+  assert.equal(session.meter.estimated,true);
+  assert.equal(session.meter.upperBound,true);
+  assert.equal(session.meter.tokens,2003000);
+  assert.match(sessionStats(session,'en',metadata).text,/≤/);
+  assert.ok(requestInputTokens(session,0,metadata)<usage.prompt_tokens);
+  assert.deepEqual(usage,{prompt_tokens:2000000,completion_tokens:3000});
+});
+
+test('a large server billing bound triggers compression without mistaking summed steps for an oversized request',async()=>{
+  const session={messages:[{role:'user',content:[{type:'file',file_id:'file-api-large'},{type:'text',text:'Read it'}]},{role:'assistant',content:'Findings'}],compactions:0};
+  const metadata={model:'deepseek-flash',systemPrompt:SYSTEM_PROMPT,includeReasoning:true,aggregateUsage:true};
+  rememberUsage(session,{prompt_tokens:2000000,completion_tokens:1000},metadata);
+  let calls=0;
+  const result=await compactContext(session,'key',new AbortController().signal,()=>{},async(key,messages,signal,onText,http,options)=>{
+    calls++;assert.equal(messages[1].content[0].file_id,'file-api-large');assert.ok(options.maxOutputTokens>0);
+    onText('Preserved findings from the long file.');
+    return {prompt_tokens:900000,completion_tokens:20};
+  },0,false,SYSTEM_PROMPT,{contextWindow:1048576,maxOutputTokens:393216},'deepseek-flash',true,{schemaTokens:0,schemaHash:''});
+  assert.equal(calls,1);assert.ok(result);assert.equal(session.compactions,1);assert.equal(session.meter.upperBound,undefined);
+  const again=await compactContext(session,'key',new AbortController().signal,()=>{},async()=>assert.fail('No repeat compression'),0,false,SYSTEM_PROMPT,{},'deepseek-flash');
+  assert.equal(again,null);
+});
+
+test('native opaque context bounds survive same-model prompt changes and include appended messages',()=>{
+  const session={messages:[{role:'user',content:[{type:'file',file_id:'file-api-large'},{type:'text',text:'Question'}]}]};
+  const first={model:'deepseek-flash',systemPrompt:'Original prompt',includeReasoning:true,aggregateUsage:true};
+  rememberUsage(session,{prompt_tokens:700000,completion_tokens:100},first);
+  const next={model:'deepseek-flash',systemPrompt:'New Notebook instructions '.repeat(20),includeReasoning:false};
+  session.messages.push({role:'user',content:'Follow up'});
+  const growth=Math.max(0,estimateText(next.systemPrompt)-estimateText(first.systemPrompt));
+  assert.equal(contextTokens(session,next),700100+growth+estimateMessages(session.messages.slice(1),next));
+  assert.match(sessionStats(session,'en',next).text,/≤/);
+  assert.ok(requestInputTokens(session,0,next)<700100);
+  assert.doesNotMatch(sessionStats(session,'en',{...next,model:'different-model'}).text,/≤/);
+});
 
 test('context estimates can exclude reasoning without changing retained tool history', () => {
   const messages = history(), original = JSON.stringify(messages);
@@ -155,4 +196,58 @@ test('compression rejects every live content, reasoning, native-argument or prov
   const session={messages:history()};
   await compactContext(session,'fake',new AbortController().signal,()=>{},async(_key,_messages,_signal,onText)=>{session.messages[0].content=Array.from(session.messages[0].content).join('');onText('A short checkpoint.');return{prompt_tokens:1000,completion_tokens:10};},0,true);
   assert.equal(session.compactions,1);
+});
+
+test('tool schema overlap adjusts only the next budget while measured context and usage remain exact',()=>{
+  const metadata={model:'custom',systemPrompt:SYSTEM_PROMPT,includeReasoning:true},schema={schemaTokens:500,schemaHash:'a'.repeat(64)};
+  const session={messages:history()},usage={prompt_tokens:900,completion_tokens:100,prompt_cache_hit_tokens:600,prompt_cache_miss_tokens:300};
+  const original=JSON.stringify(usage),limits={contextWindow:4096,maxOutputTokens:4096};
+  rememberUsage(session,usage,{...metadata,...schema});
+  assert.equal(session.meter.tokens,1000);assert.equal(session.meter.estimated,false);
+  assert.equal(contextTokens(session,metadata),1000);assert.doesNotMatch(sessionStats(session,'en',metadata).text,/Context ~/);
+  assert.equal(requestInputTokens(session,523,{...metadata,...schema}),1023);
+  assert.equal(outputBudget(session,523,limits,{...metadata,...schema}),4096-1023-contextReserve(limits));
+  const changed={schemaTokens:800,schemaHash:'b'.repeat(64)};
+  assert.equal(requestInputTokens(session,823,{...metadata,...changed}),1323);
+  assert.equal(requestInputTokens(session,0,{...metadata,schemaTokens:0,schemaHash:''}),500);
+  assert.equal(JSON.stringify(usage),original);assert.equal(session.meter.tokens,1000);
+});
+
+test('schema budget credit is conservative for legacy, unknown, invalid or incompatible meters',()=>{
+  const metadata={model:'custom',systemPrompt:SYSTEM_PROMPT,includeReasoning:true},schema={schemaTokens:500,schemaHash:'a'.repeat(64)};
+  const session={messages:history(),meter:{tokens:1000,count:4,...metadata}};
+  assert.equal(requestInputTokens(session,500,{...metadata,...schema}),1500);
+  Object.assign(session.meter,schema);
+  assert.equal(requestInputTokens(session,500,metadata),1500);
+  for(const invalid of [{schemaTokens:-1,schemaHash:''},{schemaTokens:500,schemaHash:'not-a-hash'},{schemaTokens:0,schemaHash:'a'.repeat(64)}])assert.equal(requestInputTokens(session,500,{...metadata,...invalid}),1500);
+  for(const changed of [{model:'other'},{includeReasoning:false}]){
+    const next={...metadata,...schema,...changed};
+    assert.equal(requestInputTokens(session,500,next),contextTokens(session,next)+500);
+  }
+});
+
+test('automatic compression does not count an unchanged tool schema twice at the threshold',async()=>{
+  const schema={schemaTokens:500,schemaHash:'a'.repeat(64)},session={messages:history(),meter:{tokens:799999,count:4,model:'custom',systemPrompt:SYSTEM_PROMPT,includeReasoning:true,...schema}};
+  const result=await compactContext(session,'fake',new AbortController().signal,()=>{},()=>assert.fail('Duplicate schema triggered compression'),500,false,SYSTEM_PROMPT,{},'custom',true,schema);
+  assert.equal(result,null);assert.equal(session.meter.tokens,799999);assert.equal(session.messages.length,4);
+});
+
+test('compression budgets its tool-free request without changing the measured before value or raw usage',async()=>{
+  const {COMPRESSION_SYSTEM_PROMPT}=require('./src/prompts'),schema={schemaTokens:500,schemaHash:'a'.repeat(64)};
+  const session={messages:history(),meter:{tokens:1400,count:4,model:'custom',systemPrompt:SYSTEM_PROMPT,includeReasoning:true,...schema}},limits={contextWindow:4096,maxOutputTokens:4096};
+  const instructionTokens=estimateText(COMPRESSION_PROMPT)+estimateText(COMPRESSION_SYSTEM_PROMPT)+40;
+  const result=await compactContext(session,'fake',new AbortController().signal,()=>{},async(_key,_messages,_signal,onText,_http,options)=>{
+    assert.equal(options.maxOutputTokens,4096-(1400-500)-instructionTokens-Math.min(1024,Math.floor(4096/50)));
+    onText('A short checkpoint.');return {prompt_tokens:900,completion_tokens:10,prompt_cache_hit_tokens:600,prompt_cache_miss_tokens:300};
+  },0,true,SYSTEM_PROMPT,limits,'custom',true);
+  assert.equal(result.before,1400);assert.equal(result.usage.prompt_tokens,900);assert.equal(session.cache.hit,600);assert.equal(session.cache.miss,300);
+  assert.equal(session.meter.schemaTokens,undefined);assert.equal(session.meter.estimated,true);
+});
+
+test('a summary cannot appear shorter solely because its tool-free request omits the old schema',async()=>{
+  const session={messages:history(),meter:{tokens:1800,count:4,model:'custom',systemPrompt:SYSTEM_PROMPT,includeReasoning:true,schemaTokens:1200,schemaHash:'a'.repeat(64)}};
+  const original=JSON.stringify(session.messages),summary='A'.repeat(2500),after=estimateMessages([{role:'system',content:SYSTEM_PROMPT},{role:'user',content:'Continuation checkpoint from earlier turns; use it as background, not as a new request:\n\n'+summary}]);
+  assert.ok(after>600&&after<1800);
+  await assert.rejects(compactContext(session,'fake',new AbortController().signal,()=>{},async(_key,_messages,_signal,onText)=>{onText(summary);return {prompt_tokens:600,completion_tokens:750};},0,true,SYSTEM_PROMPT,{},'custom',true),/没有有效缩短上下文/);
+  assert.equal(JSON.stringify(session.messages),original);assert.equal(session.meter.tokens,1800);
 });

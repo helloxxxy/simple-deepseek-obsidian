@@ -1,12 +1,41 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { runToolTurn, addUsage, turnTools } = require('./src/tool-turn');
+const { runToolTurn, addUsage, turnTools, toolSchemaMetadata } = require('./src/tool-turn');
 const { SYSTEM_PROMPT } = require('./src/context');
 const { NotebookEditBuffer, notebookHash } = require('./src/notebook');
 
 const usage = n => ({ prompt_tokens: n * 100, completion_tokens: n * 10, prompt_cache_hit_tokens: n * 60, prompt_cache_miss_tokens: n * 40, total_tokens: n * 110, completion_tokens_details: { reasoning_tokens: n * 3 } });
 const call = (id, name, args) => ({ id, type: 'function', function: { name, arguments: typeof args === 'string' ? args : JSON.stringify(args) } });
 const cancelled = () => Object.assign(new Error('stopped'), { name: 'AbortError' });
+
+test('native web uses server tools and replays page signatures across requests while Notebook retains client tools', async () => {
+  assert.deepEqual(turnTools(null,true,null,undefined,true),[{type:'deepseek_web_search'},{type:'deepseek_read_url'}]);
+  assert.ok(turnTools({},true,null,undefined,true).every(tool=>tool.type==='function'));
+  assert.deepEqual(turnTools(null,false,null,undefined,true),[]);
+  const {chat}=require('./src/core');
+  const steps=[{index:0,reasoning_content:'Before search',calls:[{index:0,type:'deepseek_read_url',kind:'read_link',status:'completed',signature:'opaque',page:{url:'https://example.com'}}]}];
+  const session={messages:[{role:'user',content:[{type:'file',file_id:'file-api-test'},{type:'text',text:'Read the page'}]}]};
+  const reports=[],thoughts=[],records=[];
+  let requestCount=0;
+  const send=(key,messages,signal,onText,_http,options)=>chat(key,messages,signal,onText,async(_url,request)=>{
+    const body=JSON.parse(request.body);
+    assert.deepEqual(body.tools,[{type:'deepseek_web_search'},{type:'deepseek_read_url'}]);
+    if(requestCount++) assert.deepEqual(body.messages[2].server_tool_calls,steps);
+    const chunks=[{delta:{reasoning_content:'Before search'}},{delta:{},server_tool_event:{type:'step_reasoning_done',step:0}},{delta:{reasoning_content:'Final',content:'Answer'}},{delta:{server_tool_calls:steps,annotations:[]},finish_reason:'stop'}];
+    for(const choice of chunks) request.onChunk(Buffer.from('data: '+JSON.stringify({choices:[choice],usage:choice.finish_reason?{...usage(1),server_tool_use:{tool_fetch:1}}:undefined})+'\n\n'));
+    request.onChunk(Buffer.from('data: [DONE]\n\n'));
+  },options);
+  const options={key:'fake',session,signal:new AbortController().signal,model:'deepseek-flash',systemPrompt:SYSTEM_PROMPT,capabilities:{contextWindow:1048576,maxOutputTokens:393216},nativeWeb:true,send,onThinking:text=>thoughts.push(text),onUsage:(_usage,_assistant,meta)=>reports.push(meta),onRecord:record=>records.push(record)};
+  await runToolTurn(options);
+  assert.equal(session.messages.at(-1).reasoning_content,'Final');
+  assert.deepEqual(session.messages.at(-1).server_tool_calls,steps);
+  assert.equal(reports[0].aggregateUsage,true);
+  assert.equal(thoughts.join(''),'Before searchFinal');
+  session.messages.push({role:'user',content:'Continue'});
+  const result=await runToolTurn(options);
+  assert.equal(result.usage.server_tool_use.tool_fetch,1);
+  assert.ok(records.some(record=>record.type==='server_tool_event'));
+});
 
 test('real chat SSE parser and tool orchestration complete a fetch round without losing raw reasoning',async()=>{
   const {chat}=require('./src/core');let requests=0;const visible=[],thinking=[];
@@ -66,6 +95,43 @@ function nativeHarness(script, extras = {}) {
   },options);
   return h;
 }
+
+test('tool request budgets reuse the measured schema once and report detached actual schema metadata',async()=>{
+  const {rememberUsage,contextTokens,contextReserve}=require('./src/context'),preflight=[],reported=[];
+  const metadata={model:'deepseek-flash',systemPrompt:SYSTEM_PROMPT,includeReasoning:true};
+  const h=harness([
+    {calls:[call('budget-search','search_web',{query:'source'})],usage:{prompt_tokens:900,completion_tokens:100}},
+    {text:'Done.',inspect:({options})=>{
+      assert.equal(options.maxOutputTokens,4096-contextTokens(h.session,metadata)-contextReserve(h.options.capabilities));
+    },usage:{prompt_tokens:1000,completion_tokens:10}}
+  ],{capabilities:{contextWindow:4096,maxOutputTokens:4096},web:{execute:async()=>'{"results":[]}'},
+    beforeRequest:async(extra,schema)=>{preflight.push({extra,...schema});schema.schemaTokens=1;schema.schemaHash='mutated callback';},
+    onUsage:(usage,_assistant,request)=>{reported.push({...request});rememberUsage(h.session,usage,{...metadata,...request});}
+  });
+  const result=await h.run(),schema=toolSchemaMetadata(turnTools(null));
+  assert.deepEqual(preflight,[{extra:schema.schemaTokens,...schema},{extra:schema.schemaTokens,...schema}]);
+  assert.deepEqual(reported,[{includeReasoning:true,...schema},{includeReasoning:true,...schema}]);
+  assert.equal(h.session.meter.tokens,1010);assert.equal(h.session.meter.estimated,false);
+  assert.equal(result.usage.prompt_tokens,1900);assert.equal(result.usage.completion_tokens,110);
+});
+
+test('a revoked Notebook uses its reduced actual schema budget and usage metadata on the next request',async()=>{
+  const {rememberUsage,contextTokens,contextReserve}=require('./src/context');
+  let available=true;const reported=[],metadata={model:'deepseek-flash',systemPrompt:SYSTEM_PROMPT,includeReasoning:true},notebook=new FakeEditBuffer();
+  const h=harness([
+    {calls:[call('schema-change','search_web',{query:'source'})],usage:{prompt_tokens:5000,completion_tokens:100}},
+    {text:'Web answer.',inspect:({options})=>{
+      const current=toolSchemaMetadata(options.tools),previous=reported[0];
+      assert.ok(current.schemaTokens<previous.schemaTokens);
+      assert.equal(options.maxOutputTokens,8192-contextTokens(h.session,metadata)-current.schemaTokens+previous.schemaTokens-contextReserve(h.options.capabilities));
+    },usage:{prompt_tokens:4000,completion_tokens:10}}
+  ],{notebook,notebookAvailable:()=>available,capabilities:{contextWindow:8192,maxOutputTokens:8192},web:{execute:async()=>{available=false;return '{"results":[]}';}},
+    onUsage:(usage,_assistant,request)=>{reported.push({...request});rememberUsage(h.session,usage,{...metadata,...request});}
+  });
+  await h.run();assert.deepEqual(reported.map(item=>item.schemaHash),h.requests.map(item=>toolSchemaMetadata(item.options.tools).schemaHash));
+  const plain=harness([{text:'No tools.'}],{webEnabled:false});await plain.run();
+  assert.deepEqual(plain.reportedUsage[0][2],{includeReasoning:false,schemaTokens:0,schemaHash:''});
+});
 
 class FakeEditBuffer {
   constructor() { this.currentHash = 'hash-0'; this.operations = []; this.batches = []; this.started = false; this.done = false; this.applyCalls = 0; }

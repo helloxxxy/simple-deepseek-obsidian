@@ -63,7 +63,7 @@ function protocolRequestInfo(text, userText = '') {
   const match = scanProtocol(text);
   if (match.index < 0 || exampleIntroduction(text.slice(0, match.index))) return { leaked: false, webOnly: false };
   const names = [...text.slice(match.index).matchAll(/\binvoke\b[^>\r\n]*\bname\s*=\s*["']([a-zA-Z0-9_-]+)|"name"\s*:\s*"([a-zA-Z0-9_-]+)/g)].map(item => item[1] || item[2]);
-  return { leaked: true, webOnly: names.length > 0 && names.every(name => ['search_web', 'fetch_page'].includes(name)) };
+  return { leaked: true, webOnly: names.length > 0 && names.every(name => ['search_web', 'fetch_page','deepseek_web_search','deepseek_read_url'].includes(name)) };
 }
 function textualToolRequest(text, userText = '') { return protocolRequestInfo(text, userText).leaked; }
 

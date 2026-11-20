@@ -4,9 +4,9 @@ const sync = require('y-protocols/sync.js');
 const encoding = require('lib0/encoding');
 const decoding = require('lib0/decoding');
 const { WebSocket } = require('ws');
-const { YNotebook } = require('@jupyter/ydoc');
 const { buildSystemPrompt } = require('./prompts');
 const { sanitizeReferenceText } = require('./text-safety');
+const { outputFigures, figureFile } = require('./notebook-images');
 
 const NOTEBOOK_SYSTEM_PROMPT = buildSystemPrompt({ webEnabled: true, notebookMode: true, notebookEnabled: true });
 
@@ -36,13 +36,14 @@ function safeOutputs(outputs) {
     return null;
   }).filter(Boolean);
 }
-function safeNotebook(notebook) {
+function safeNotebook(notebook, includeFigures = false) {
   const cells = Array.isArray(notebook?.cells) ? notebook.cells : [], hashedCells = [], safeCells = [];
   for (const [index, cell] of cells.entries()) {
-    const id = cellId(cell, index), source = joinSource(cell.source), outputs = safeOutputs(cell.outputs);
+    const id = cellId(cell, index), source = joinSource(cell.source), rawOutputs = cell.outputs, outputs = safeOutputs(rawOutputs);
+    const figures = includeFigures && cell.cell_type === 'code' ? outputFigures(rawOutputs) : [];
     hashedCells.push({ id, type: cell.cell_type, source, outputs });
     safeCells.push({ cellId: id, index, cellType: cell.cell_type || 'raw', source: safeSource(source),
-      executionCount: Number.isInteger(cell.execution_count) ? cell.execution_count : null, outputs });
+      executionCount: Number.isInteger(cell.execution_count) ? cell.execution_count : null, outputs, ...(figures.length ? {figures} : {}) });
   }
   return { notebookHash: hash(hashedCells), cells: safeCells };
 }
@@ -51,12 +52,21 @@ function notebookHash(notebook) {
   return hash(cells.map((cell, index) => ({ id: cellId(cell, index), type: cell.cell_type, source: joinSource(cell.source), outputs: safeOutputs(cell.outputs) })));
 }
 function snapshotFromSafe(safe) {
-  return { hash: safe.notebookHash, cells: Object.fromEntries(safe.cells.map(cell => [cell.cellId, {
+  const snapshot = { hash: safe.notebookHash, cells: Object.fromEntries(safe.cells.map(cell => [cell.cellId, {
     hash: hash({ index: cell.index, cellType: cell.cellType, source: cell.source, outputs: cell.outputs }),
     index: cell.index, cellType: cell.cellType, source: cell.source, sourceHash: hash(cell.source), outputsHash: hash(cell.outputs)
   }])) };
+  const images = [];
+  for (const cell of safe.cells) {
+    if (cell.figures) {
+      snapshot.cells[cell.cellId].figures = cell.figures;
+      images.push([cell.cellId,cell.figures]);
+    }
+  }
+  if (images.length) snapshot.figureHash = hash(images);
+  return snapshot;
 }
-function notebookSnapshot(notebook) { return snapshotFromSafe(safeNotebook(notebook)); }
+function notebookSnapshot(notebook) { return snapshotFromSafe(safeNotebook(notebook,true)); }
 function sourceLinePatch(before, after) {
   const oldLines = before.split('\n'), newLines = after.split('\n');
   let start = 0, oldEnd = oldLines.length, newEnd = newLines.length;
@@ -65,13 +75,15 @@ function sourceLinePatch(before, after) {
   return { startLine: start + 1, deleteLines: oldEnd - start, insertLines: newLines.slice(start, newEnd) };
 }
 function notebookDelta(notebook, previous) {
-  const safe = safeNotebook(notebook), current = snapshotFromSafe(safe), changed = [], removed = [];
+  const safe = safeNotebook(notebook,true), current = snapshotFromSafe(safe), changed = [], removed = [];
   for (const cell of safe.cells) {
     const old = previous?.cells?.[cell.cellId], now = current.cells[cell.cellId];
     if (!old || typeof old.sourceHash !== 'string' || typeof old.outputsHash !== 'string') { changed.push(cell); continue; }
     const sourceChanged = old.sourceHash !== now.sourceHash, outputsChanged = old.outputsHash !== now.outputsHash;
-    if (!sourceChanged && !outputsChanged && old.index === cell.index && old.cellType === cell.cellType) continue;
+    const figuresChanged = JSON.stringify(old.figures) !== JSON.stringify(now.figures);
+    if (!sourceChanged && !outputsChanged && !figuresChanged && old.index === cell.index && old.cellType === cell.cellType) continue;
     const update = { cellId: cell.cellId, index: cell.index, cellType: cell.cellType };
+    if (figuresChanged) update.figures = now.figures || [];
     if (sourceChanged) {
       const patch = typeof old.source === 'string' ? sourceLinePatch(old.source, cell.source) : null;
       if (patch && JSON.stringify(patch).length < JSON.stringify(cell.source).length) update.sourcePatch = patch;
@@ -84,7 +96,7 @@ function notebookDelta(notebook, previous) {
   return { baseHash: previous?.hash || null, currentHash: current.hash, changed, removed, snapshot: current };
 }
 function notebookContext(delta) {
-  return `\n\n[Notebook delta; images, attachments, base64, and widgets were removed locally]\n${JSON.stringify({ previousHash: delta.baseHash, currentHash: delta.currentHash, changed: delta.changed, removed: delta.removed })}`;
+  return `\n\n[Notebook delta; cell source and text outputs]\n${JSON.stringify({ previousHash: delta.baseHash, currentHash: delta.currentHash, figureHash:delta.snapshot.figureHash, changed: delta.changed, removed: delta.removed })}`;
 }
 function notebookCurrentHash(text) {
   const marker = '[Notebook delta';
@@ -385,8 +397,8 @@ function requestUrlFetch(requestUrl) {
   };
 }
 class YSocket {
-  constructor({ url, token, roomId, sessionId, notebook = new YNotebook(), timeout = 15000, signal, onClose = () => {} }) {
-    this.notebook = notebook; this.closed = false; this.synced = false; this.signal = signal; this.onClose = onClose;
+  constructor({ url, token, roomId, sessionId, notebook, timeout = 15000, signal, onClose = () => {} }) {
+    this.notebook = notebook || new (require('@jupyter/ydoc').YNotebook)(); this.closed = false; this.synced = false; this.signal = signal; this.onClose = onClose;
     const wsBase = url.replace(/^http/, 'ws');
     const query = new URLSearchParams({ sessionId, ...(token ? { token } : {}) });
     this.url = `${wsBase}/api/collaboration/room/${encodeURIComponent(roomId).replace(/%3A/gi, ':')}?${query}`;
@@ -432,9 +444,10 @@ class YSocket {
   }
 }
 class JupyterRtcClient {
-  constructor({ baseUrl, token = '', notebookPath, fetchImpl = (url, options) => globalThis.fetch(url, options), onStatus = () => {}, timeout = 15000, restTimeout = 60000, kernelIdleGrace = 20000, kernelPollInterval = 5000 }) {
+  constructor({ baseUrl, token = '', notebookPath, fetchImpl = (url, options) => globalThis.fetch(url, options), onStatus = () => {}, timeout = 15000, restTimeout = 60000, kernelIdleGrace = 20000, kernelPollInterval = 5000, changeNotifyDelay = 100 }) {
     this.baseUrl = normalizeBaseUrl(baseUrl); this.token = token.trim(); this.path = encodeNotebookPath(notebookPath); this.fetch = (url, options) => fetchImpl.call(globalThis, url, options); this.onStatus = onStatus; this.timeout = timeout; this.restTimeout = restTimeout; this.kernelIdleGrace = kernelIdleGrace; this.kernelPollInterval = kernelPollInterval; this.socket = null; this.changeListeners = new Set();
     this.closed = false; this.lifetime = new AbortController(); this.requestControllers = new Set(); this.kernelSockets = new Set(); this.connecting = null; this.kernelConnecting = null;
+    this.changeTimer = null; this.changeNotifyDelay = Number.isFinite(changeNotifyDelay) ? Math.max(0, changeNotifyDelay) : 100;
   }
   get connected() { return !this.closed && !this.lifetime.signal.aborted && !!this.socket?.synced && !this.socket.closed && (this.socket.socket?.readyState == null || this.socket.socket.readyState === WebSocket.OPEN); }
   assertOpen() { if (this.closed || this.lifetime.signal.aborted) throw abortReason(this.lifetime.signal); }
@@ -478,13 +491,20 @@ class JupyterRtcClient {
     this.socket = socket; socket.onClose = error => { if (this.socket === socket) this.close(error); };
     await socket.ready; this.assertOpen(); if (!this.connected || this.socket !== socket) throw jupyterClosed();
     this.onStatus('connected'); this.assertOpen();
-    this.onNotebookUpdate = (_update, origin) => { if (this.connected && this.socket === socket && origin === socket) { const value = this.read(); for (const listener of this.changeListeners) listener(value); } };
+    this.onNotebookUpdate = (_update, origin) => {
+      if (!this.connected || this.socket !== socket || origin !== socket || !this.changeListeners.size || this.changeTimer !== null) return;
+      this.changeTimer = setTimeout(() => {
+        this.changeTimer = null;
+        if (!this.connected || this.socket !== socket || !this.changeListeners.size) return;
+        const value = this.read(); for (const listener of this.changeListeners) listener(value);
+      }, this.changeNotifyDelay);
+    };
     socket.notebook.ydoc.on('update', this.onNotebookUpdate);
     return this.read();
     } catch (error) { this.close(error); throw error; }
   }
   read() { if (!this.connected) throw Error('Jupyter RTC 尚未连接'); return this.socket.notebook.toJSON(); }
-  onChange(listener) { this.assertOpen(); this.changeListeners.add(listener); return () => this.changeListeners.delete(listener); }
+  onChange(listener) { this.assertOpen(); this.changeListeners.add(listener); return () => { this.changeListeners.delete(listener); if (!this.changeListeners.size) { clearTimeout(this.changeTimer); this.changeTimer = null; } }; }
   async applyPatch(patch) {
     if (!this.connected) throw Error('Jupyter RTC 尚未连接');
     const before = this.read();
@@ -558,7 +578,7 @@ class JupyterRtcClient {
     try {
     const sessions = await this.json('/api/sessions');
     this.assertOpen();
-    let session = Array.isArray(sessions) ? sessions.find(item => encodeNotebookPath(item.path || '') === this.path) : null;
+    let session = Array.isArray(sessions) ? sessions.find(item => { if (item?.type && item.type !== 'notebook') return false; try { return encodeNotebookPath(item?.path || '') === this.path; } catch { return false; } }) : null;
     if (!session) session = await this.json('/api/sessions', { method: 'POST', body: JSON.stringify({ path: decodeURIComponent(this.path), name: '', type: 'notebook', kernel: { name: this.read()?.metadata?.kernelspec?.name || 'python3' } }) });
     this.assertOpen(); const kernelId = session?.kernel?.id; if (!kernelId) throw Error('Jupyter 没有返回 Kernel');
     const sessionId = randomUUID(), wsBase = this.baseUrl.replace(/^http/, 'ws');
@@ -624,14 +644,21 @@ class JupyterRtcClient {
     return response;
   }
   messagesToOutputs(messages) {
-    const outputs = [];
+    const outputs = [], displays = new Map(); let clearPending = false;
+    const clear = () => { outputs.length = 0; displays.clear(); clearPending = false; };
+    const append = (output, displayId) => {
+      if (clearPending) clear();
+      outputs.push(output);
+      if (typeof displayId === 'string' && displayId) { const matches = displays.get(displayId) || []; matches.push(output); displays.set(displayId, matches); }
+    };
     for (const message of messages) {
       if (message.channel !== 'iopub') continue;
       const type = message.header?.msg_type, value = message.content || {};
-      if (type === 'stream') outputs.push({ output_type: 'stream', name: value.name || 'stdout', text: value.text || '' });
-      else if (type === 'display_data' || type === 'execute_result') outputs.push({ output_type: type, data: value.data || {}, metadata: value.metadata || {}, ...(type === 'execute_result' ? { execution_count: value.execution_count ?? null } : {}) });
-      else if (type === 'error') outputs.push({ output_type: 'error', ename: value.ename || '', evalue: value.evalue || '', traceback: value.traceback || [] });
-      else if (type === 'clear_output') outputs.length = 0;
+      if (type === 'stream') append({ output_type: 'stream', name: value.name || 'stdout', text: value.text || '' });
+      else if (type === 'display_data' || type === 'execute_result') append({ output_type: type, data: value.data || {}, metadata: value.metadata || {}, ...(type === 'execute_result' ? { execution_count: value.execution_count ?? null } : {}) }, value.transient?.display_id);
+      else if (type === 'update_display_data') { for (const output of displays.get(value.transient?.display_id) || []) { output.data = value.data || {}; output.metadata = value.metadata || {}; } }
+      else if (type === 'error') append({ output_type: 'error', ename: value.ename || '', evalue: value.evalue || '', traceback: value.traceback || [] });
+      else if (type === 'clear_output') { if (value.wait === true) clearPending = true; else clear(); }
     }
     return outputs;
   }
@@ -720,6 +747,7 @@ class JupyterRtcClient {
   close(error = jupyterClosed()) {
     if (this.closed) return;
     this.closed = true;
+    clearTimeout(this.changeTimer); this.changeTimer = null;
     const socket = this.socket; this.socket = null;
     if (socket && this.onNotebookUpdate) socket.notebook.ydoc.off('update', this.onNotebookUpdate);
     this.onNotebookUpdate = null; this.lifetime.abort(error);
@@ -737,4 +765,4 @@ function resultJson(notebook) {
   const safe = safeNotebook(notebook);
   return { notebookHash: safe.notebookHash, generatedAt: new Date().toISOString(), cells: safe.cells.filter(cell => cell.outputs.length).map(({ cellId, index, executionCount, outputs }) => ({ cellId, index, executionCount, outputs })) };
 }
-module.exports = { NOTEBOOK_SYSTEM_PROMPT, safeOutputs, safeNotebook, notebookHash, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, parsePatch, describePatch, validatePatch, NotebookPatchWorkspace, NotebookEditBuffer, normalizeBaseUrl, encodeNotebookPath, requestUrlFetch, JupyterRtcClient, resultJson, hash };
+module.exports = { NOTEBOOK_SYSTEM_PROMPT, safeOutputs, safeNotebook, notebookHash, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, figureFile, parsePatch, describePatch, validatePatch, NotebookPatchWorkspace, NotebookEditBuffer, normalizeBaseUrl, encodeNotebookPath, requestUrlFetch, JupyterRtcClient, resultJson, hash };

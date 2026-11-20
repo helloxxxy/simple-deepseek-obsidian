@@ -1,11 +1,21 @@
 const { createHash } = require('node:crypto');
 const { imageReferenceEdits } = require('./image-context');
-const messageFields = ['role', 'content', 'reasoning_content', 'tool_calls', 'tool_call_id'];
+const messageFields = ['role', 'content', 'reasoning_content', 'tool_calls', 'tool_call_id', 'server_tool_calls', 'annotations'];
+function validContent(content, role) {
+  if (typeof content === 'string') return true;
+  return role === 'user' && Array.isArray(content) && content.length > 0 && content.every(part => {
+    if (!part || typeof part !== 'object') return false;
+    if (part.type === 'text') return typeof part.text === 'string' && Object.keys(part).every(key => ['type','text'].includes(key));
+    return part.type === 'file' && typeof part.file_id === 'string' && /^file-[\w-]+$/.test(part.file_id) && Object.keys(part).every(key => ['type','file_id'].includes(key));
+  });
+}
 function validMessage(message) {
-  if (!message || !['user','assistant','system','tool'].includes(message.role) || typeof message.content !== 'string') return false;
+  if (!message || !['user','assistant','system','tool'].includes(message.role) || !validContent(message.content,message.role)) return false;
   if (message.role === 'tool' && (typeof message.tool_call_id !== 'string' || !message.tool_call_id)) return false;
   if (message.reasoning_content !== undefined && typeof message.reasoning_content !== 'string') return false;
   if (message.tool_calls !== undefined && (!Array.isArray(message.tool_calls) || !message.tool_calls.every(call => call && typeof call.id === 'string' && call.type === 'function' && typeof call.function?.name === 'string' && typeof call.function?.arguments === 'string'))) return false;
+  if (message.server_tool_calls !== undefined && !Array.isArray(message.server_tool_calls)) return false;
+  if (message.annotations !== undefined && !Array.isArray(message.annotations)) return false;
   return true;
 }
 function cloneToolCalls(calls) {
@@ -59,7 +69,20 @@ function sameMessage(message, snapshot) {
   });
 }
 function entryMessages(entry) {
-  if (Array.isArray(entry.modelMessages) && entry.modelMessages.every(validMessage)) return entry.modelMessages.map(copyMessage);
+  if (Array.isArray(entry.modelMessages) && entry.modelMessages.every(validMessage)) {
+    const messages = entry.modelMessages.map(copyMessage);
+    if (entry.label === '你' && entry.files?.length && typeof entry.contextText === 'string' && messages.length === 1 && messages[0].role === 'user') {
+      // The original request can omit reference text already supplied by an earlier turn.
+      // Restore the full text before deduplicating against the surviving history.
+      const message = messages[0];
+      if (typeof message.content === 'string') message.content = entry.contextText;
+      else {
+        const parts = message.content.filter(part => part.type === 'text');
+        if (parts.length === 1) parts[0].text = entry.contextText;
+      }
+    }
+    return messages;
+  }
   if (entry.notebookEvent) return [];
   if (entry.label === '你') return [{role:'user',content:entry.contextText ?? (entry.raw + (entry.references ? '\n\n' + entry.references : ''))}];
   if (entry.label.startsWith('MinerU · ')) return entry.raw ? [{role:'user',content:entry.contextText ?? ('Extracted text from uploaded file '+JSON.stringify(entry.label.slice('MinerU · '.length))+' for later questions, as reference data:\n\n'+entry.raw)}] : [];
@@ -106,6 +129,7 @@ function hiddenPrefixLength(entry, content) {
   return content.startsWith(tail, contentOffset) ? contentOffset + tail.length : -1;
 }
 function deduplicateEntryReferences(entry, content, knownLibrary, knownWeb, knownImages) {
+  if (Array.isArray(content)) return content.map(part => part.type === 'text' ? {...part,text:deduplicateEntryReferences(entry,part.text,knownLibrary,knownWeb,knownImages)} : {...part});
   const prefix = hiddenPrefixLength(entry, content);
   if (prefix < 0) return content;
   const excludedImages = [];
@@ -140,11 +164,23 @@ function deduplicateEntryReferences(entry, content, knownLibrary, knownWeb, know
   return content;
 }
 function rebuildEntryMessages(entries) {
-  const messages = [], knownLibrary = new Set(), knownWeb = new Map(), knownImages = new Map();
+  const messages = [], knownLibrary = new Set(), knownWeb = new Map(), knownImages = new Map(), knownFiles = new Set();
   for (const entry of entries) {
     const restored = entryMessages(entry);
     for (const message of restored) {
-      if (entry.label === '你' && message.role === 'user') message.content = deduplicateEntryReferences(entry, message.content, knownLibrary, knownWeb, knownImages);
+      if (entry.label === '你' && message.role === 'user') {
+        message.content = deduplicateEntryReferences(entry, message.content, knownLibrary, knownWeb, knownImages);
+        for (const part of Array.isArray(message.content) ? message.content : []) if (part.type === 'file') knownFiles.add(part.file_id);
+        const missing = (entry.files || []).filter(file => typeof file?.id === 'string' && /^file-[\w-]+$/.test(file.id) && !knownFiles.has(file.id));
+        if (missing.length) {
+          if (typeof message.content === 'string') message.content = [{type:'text',text:message.content}];
+          for (const file of missing) {
+            if (knownFiles.has(file.id)) continue;
+            if (file.notebookFigure) message.content.push({type:'text',text:'Notebook output figure SHA-256: '+file.hash});
+            message.content.push({type:'file',file_id:file.id}); knownFiles.add(file.id);
+          }
+        }
+      }
       messages.push(message); rememberWebResults(message, knownWeb);
     }
   }

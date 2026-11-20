@@ -66,4 +66,40 @@ function mathExpressions(markdown) {
   normalizeMath(markdown, expression => expressions.push(expression));
   return expressions;
 }
-module.exports = { normalizeMath, mathExpressions };
+
+function splitMarkdownBlocks(text, tokenLimit = 8000) {
+  const chunks = []; let start = 0, offset = 0, units = 0, fence = null, math = false;
+  const full = () => ({cacheable:false,chunks:[{text,stable:false}]});
+  for (const line of text.split(/(?<=\n)/)) {
+    offset += line.length;
+    for (const char of line) units += char.charCodeAt(0) < 128 ? 3 : 6;
+    if (fence) {
+      if (fence.close.test(line)) fence = null;
+    } else if (!math && /^ {0,3}(`{3,}|~{3,})/.test(line)) {
+      const opening = /^ {0,3}(`{3,}|~{3,})([^\r\n]*)/.exec(line);
+      if (opening[1][0] === '`' && opening[2].includes('`')) return full();
+      fence = {close:new RegExp('^ {0,3}'+opening[1][0]+'{'+opening[1].length+',}[ \\t]*(?:\\r?\\n)?$')};
+    } else {
+      // These constructs can depend on content outside an otherwise closed block.
+      if (line.includes('%%') || /^(?: {4}|\t)|^ {0,3}(?:>|[-+*][ \t]|\d+[.)][ \t])|<[A-Za-z!/?]|\||!?\[[^\]\r\n]+\](?!\()|\\(?:label|ref|eqref|tag|def|gdef|newcommand|renewcommand|require)\b/.test(line)) return full();
+      let ticks = 0;
+      for (let index = 0; index < line.length; index++) {
+        if (line[index] === '\\') { index++; continue; }
+        if (!math && line[index] === '`') {
+          let end = index + 1; while (line[end] === '`') end++;
+          const length = end-index; if (!ticks) ticks = length; else if (ticks === length) ticks = 0;
+          index = end-1;
+        } else if (!ticks && line.startsWith('$$',index)) { math = !math; index++; }
+      }
+      if (ticks) return full();
+    }
+    if (!fence && !math && /^\s*$/.test(line) && Math.ceil(units/10) >= tokenLimit) {
+      chunks.push({text:text.slice(start,offset),stable:true}); start = offset; units = 0;
+    }
+  }
+  if (start < text.length || !chunks.length) chunks.push({text:text.slice(start),stable:false});
+  return {cacheable:true,chunks};
+}
+function splitMarkdown(text, tokenLimit = 8000) { return splitMarkdownBlocks(text,tokenLimit).chunks.map(chunk => chunk.text); }
+
+module.exports = { normalizeMath, mathExpressions, splitMarkdown, splitMarkdownBlocks };

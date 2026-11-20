@@ -8,6 +8,8 @@ test('the reported full-width DSML response is identified without treating param
   assert.deepEqual(protocolRequestInfo(dsml, 'what about dc'), {leaked:true,webOnly:true});
   for (const text of [dsml, dsml.replace(/｜/g, '|'), dsml.replace(/｜｜/g, '|'), 'Searching now.\n'+dsml+'\nPlease wait.', '```xml\n'+dsml+'\n```', '<tool_call>{"name":"search_web","arguments":{}}</tool_call>']) assert.equal(textualToolRequest(text, 'Check the weather'), true);
   assert.deepEqual(protocolRequestInfo('<||DSML|| invoke name="stage_notebook_edits"></||DSML|| invoke>'), {leaked:true,webOnly:false});
+  assert.deepEqual(protocolRequestInfo('<tool_call>{"name":"deepseek_web_search","arguments":{}}</tool_call>'),{leaked:true,webOnly:true});
+  assert.deepEqual(protocolRequestInfo('<tool_call>{"name":"deepseek_read_url","arguments":{}}</tool_call>'),{leaked:true,webOnly:true});
 });
 
 test('DSML and XML split at every possible SSE boundary never enter the visible stream', () => {

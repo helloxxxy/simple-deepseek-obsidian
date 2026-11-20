@@ -11,6 +11,84 @@ async function open(chat=async(k,m,s,d)=>{d('Answer');return usage;},parse=async
   const view=env.plugin.factory({});await view.onOpen();return{...env,view};
 }
 
+test('delete a standalone conversion from its footer after switching history and keep its deletion on restart',async()=>{
+  const env=await open(undefined,async()=>'Standalone text');
+  const {view,plugin}=env;
+  await view.run(signal=>view.uploadPdf({name:'draft.pdf'},'key',signal));
+  const id=plugin.activeConversationId;
+  await view.newConversation(); await view.switchConversation(id);
+  const button=view.feed.querySelector('button[aria-label="Delete conversion result"]');
+  assert.ok(button); assert.equal(button.disabled,false);
+  view.input.value='Draft stays here'; button.click(); await plugin.saveQueue;
+  assert.equal(view.session.entries.length,0); assert.equal(view.session.messages.length,0);
+  assert.equal(view.input.value,'Draft stays here'); assert.equal(view.feed.querySelector('.sd-message'),null);
+  await view.onClose();
+  const reopened=await open(undefined,undefined,{saved:env.saved.at(-1),conversationState:env.conversationState});
+  assert.equal(reopened.plugin.activeConversationId,id); assert.equal(reopened.view.session.entries.length,0);
+  await reopened.view.onClose();
+});
+
+test('delete an independent conversion without disturbing compacted chat, other conversions, or row state',async()=>{
+  const {view}=await open(undefined,async file=>file.name);
+  view.input.value='A question'; await view.send();
+  for(const name of ['one.pdf','two.pdf']) await view.run(signal=>view.uploadPdf({name},'key',signal));
+  const answer=view.session.entries[1], answerRow=view.feed.querySelectorAll('.sd-message')[1];
+  view.messages.splice(0,view.messages.length,{role:'user',content:'Checkpoint for the earlier question'});
+  view.session.compactions=2; view.session.meter={tokens:111,count:1,estimated:false};
+  const before=JSON.stringify({messages:view.messages,meter:view.session.meter});
+  const [first]=view.feed.querySelectorAll('button[aria-label="Delete conversion result"]');
+  first.click(); await view.plugin.saveQueue;
+  assert.deepEqual(Array.from(view.session.entries,entry=>entry.raw),['A question',answer.raw,'two.pdf']);
+  assert.equal(view.feed.querySelectorAll('.sd-message')[1],answerRow);
+  assert.equal(JSON.stringify({messages:view.messages,meter:view.session.meter}),before);
+  assert.equal(view.session.compactions,2); await view.onClose();
+});
+
+test('deleting a legacy conversion removes its model text directly or rebuilds a compressed checkpoint',async()=>{
+  for(const compacted of [false,true]) {
+    const {view}=await open();
+    view.input.value='Question before the PDF'; await view.send();
+    const before=JSON.stringify(view.messages);
+    const conversion=view.row('MinerU · old.pdf','Old extracted text');
+    const message={role:'user',content:'Unique old conversion reference'};
+    conversion.entry.contextText=message.content; conversion.entry.modelMessages=[message]; view.messages.push(message);
+    if(compacted) { view.messages.splice(0,view.messages.length,{role:'user',content:'Summary contains the old conversion'}); view.session.compactions=1; }
+    conversion.element.querySelector('button[aria-label="Delete conversion result"]').click(); await view.plugin.saveQueue;
+    assert.equal(JSON.stringify(view.messages),before); assert.equal(view.session.compactions,0);
+    assert.equal(view.session.meter,null); assert.equal(view.session.entries.length,2);
+    await view.onClose();
+  }
+});
+
+test('a stopped conversion can be deleted while its abandoned render finishes and its text cannot offer Notebook edits',async()=>{
+  const pending=deferred();
+  let rendering=false;
+  const patch=JSON.stringify({baseHash:'a'.repeat(64),operations:[{type:'insert_cell',cellType:'code',source:'print(42)'}]});
+  const {view}=await open(undefined,async()=>patch,{render:async text=>{if(text===patch){rendering=true;await pending.promise;}}});
+  const work=view.run(signal=>view.uploadPdf({name:'example.pdf'},'key',signal));
+  await until(()=>rendering);
+  const state=[...view.rows].at(-1), button=state.element.querySelector('button[aria-label="Delete conversion result"]');
+  assert.equal(button.disabled,true); button.click(); assert.equal(view.session.entries.length,1);
+  view.sendButton.click(); await work;
+  assert.equal(button.disabled,false); view.addPatchAction(state);
+  assert.equal(state.element.querySelector('.sd-notebook-apply'),null);
+  button.click(); await view.plugin.saveQueue; pending.resolve(); await until(()=>!state.running);
+  assert.equal(view.rows.size,0); assert.equal(view.session.entries.length,0); await view.onClose();
+});
+
+test('failed conversion creates no empty result and a failed attachment batch leaves the previous pending selection intact',async()=>{
+  const {view}=await open(undefined,async()=>{throw Error('Conversion failed');});
+  await view.run(signal=>view.uploadPdf({name:'bad.pdf'},'test',signal));
+  assert.equal(view.session.entries.length,0);
+  assert.equal(view.rows.size,0);
+  const existing={name:'existing.md'};
+  await view.uploadFiles([existing]);
+  await view.uploadFiles([{name:'first.pdf'},{name:'unsupported.zip'}]);
+  assert.deepEqual(Array.from(view.pendingFiles),[existing]);
+  assert.deepEqual(Array.from(view.pendingImageList.querySelectorAll('.sd-image-name'),node=>node.textContent),['existing.md']);
+  await view.onClose();
+});
+
 test('Stop releases a completed answer waiting for Markdown and a late render cannot follow a later reply',async()=>{
   const held=deferred();let rendering=false,requests=0;
   const env=await open(async(k,m,s,d)=>{d(++requests===1?'First answer':'Second answer');return usage;},undefined,{render:async text=>{if(text==='First answer'){rendering=true;await held.promise;}}});
@@ -28,7 +106,7 @@ test('Stop releases a completed answer waiting for Markdown and a late render ca
 test('Stop during a parsed PDF render never appends its context after the next conversation starts',async()=>{
   const held=deferred();let rendering=false;
   const env=await open(undefined,async()=>'Parsed PDF text',{render:async text=>{if(text==='Parsed PDF text'){rendering=true;await held.promise;}}});
-  const {view,plugin}=env;plugin.keys.mineru='fake-mineru';const uploading=view.upload({name:'paper.pdf'});await until(()=>rendering);
+  const {view,plugin}=env;plugin.keys.mineru='fake-mineru';const uploading=view.run(signal=>view.uploadPdf({name:'paper.pdf'},'fake-mineru',signal));await until(()=>rendering);
   const old=[...view.rows].at(-1),session=view.session;view.sendButton.click();await uploading;
   assert.equal(view.controller,null);assert.equal(session.messages.length,0);assert.equal(old.entry.contextText,undefined);
   await view.newConversation();view.input.value='New question';await view.send();held.resolve();await until(()=>!old.running);
@@ -40,7 +118,7 @@ test('a cancelled PDF stays outside context when deleting an earlier turn and re
   const held=deferred();let rendering=false,requests=0;
   const env=await open(async(k,m,s,d)=>{requests++;assert.ok(!JSON.stringify(m).includes('Cancelled PDF content'));d('Answer '+requests);return usage;},async()=>'Cancelled PDF content',{render:async text=>{if(text==='Cancelled PDF content'){rendering=true;await held.promise;}}});
   const {view,plugin}=env;view.input.value='First question';await view.send();const firstReply=view.session.entries.at(-1);
-  plugin.keys.mineru='fake-mineru';const uploading=view.upload({name:'cancelled.pdf'});await until(()=>rendering);
+  plugin.keys.mineru='fake-mineru';const uploading=view.run(signal=>view.uploadPdf({name:'cancelled.pdf'},'fake-mineru',signal));await until(()=>rendering);
   const pdf=[...view.rows].at(-1);view.sendButton.click();await uploading;held.resolve();await until(()=>!pdf.running);
   view.input.value='Second question';await view.send();await view.deleteTurn(firstReply);
   assert.deepEqual(Array.from(view.messages,message=>message.content),['Second question','Answer 2']);
@@ -98,9 +176,9 @@ test('mention searches share a scan but never reuse a result from an earlier lib
 test('a PDF upload batch retains its parser key and a later batch uses the changed key',async()=>{
   const parsed=deferred(),keys=[];
   const env=await open(undefined,async(file,key)=>{keys.push(key);if(file.name==='first.pdf')await parsed.promise;return 'Extracted '+file.name;});
-  const {view,plugin}=env;plugin.keys.mineru='first-key';const batch=view.uploadFiles([{name:'first.pdf'},{name:'second.pdf'}]);await until(()=>keys.length===1);
-  plugin.keys.mineru='second-key';parsed.resolve();await batch;await view.upload({name:'third.pdf'});
-  assert.deepEqual(keys,['first-key','first-key','second-key']);assert.equal(view.messages.filter(message=>message.role==='user').length,3);await view.onClose();
+  const {view,plugin}=env;plugin.keys.mineru='first-key';const batch=view.run(async signal=>{const key=plugin.keys.mineru;for(const name of ['first.pdf','second.pdf'])await view.uploadPdf({name},key,signal);});await until(()=>keys.length===1);
+  plugin.keys.mineru='second-key';parsed.resolve();await batch;await view.run(signal=>view.uploadPdf({name:'third.pdf'},plugin.keys.mineru,signal));
+  assert.deepEqual(keys,['first-key','first-key','second-key']);assert.equal(view.messages.length,0);assert.equal(view.session.entries.filter(entry=>entry.label.startsWith('MinerU')).length,3);await view.onClose();
 });
 
 test('a moved caret invalidates both pending mention candidates and an already displayed candidate',async()=>{

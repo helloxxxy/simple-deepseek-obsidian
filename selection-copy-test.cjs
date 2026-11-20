@@ -53,6 +53,16 @@ test('table selections produce a Markdown table with a header separator', () => 
   const f = fixture('<table><thead><tr><th>Name</th><th>Value</th></tr></thead><tbody><tr><td>a|b</td><td><strong>2</strong></td></tr></tbody></table>');
   assert.equal(selectionToMarkdown(f.all(), f.feed), '| Name | Value |\n| --- | --- |\n| a\\|b | **2** |');
 });
+test('table code formulas and links escape literal column separators without double escaping plain text', () => {
+  const f = fixture('<table><tr><th>Code</th><th>Math</th><th>Link</th><th>Text</th></tr><tr><td><code>a|b</code></td><td><span class="math" data-sd-math="$a|b$">a|b</span></td><td><a href="https://example.com/a|b">a|b</a></td><td>a|b</td></tr></table>');
+  assert.equal(selectionToMarkdown(f.all(),f.feed),'| Code | Math | Link | Text |\n| --- | --- | --- | --- |\n| `a\\|b` | $a\\|b$ | [a\\|b](https://example.com/a\\|b) | a\\|b |'); f.dom.window.close();
+});
+test('table code with literal backslashes before pipes remains exact inert inline HTML', () => {
+  const f = fixture('<table><tr><th>Code</th></tr><tr><td><code></code></td></tr></table>'),code = 'a\\|b <script>&'; f.body.querySelector('code').textContent = code;
+  const markdown = selectionToMarkdown(f.all(),f.feed),fragment = markdown.match(/<code>[\s\S]*?<\/code>/)[0],parsed = new JSDOM(fragment);
+  assert.equal(parsed.window.document.querySelector('code').textContent,code); assert.equal(parsed.window.document.querySelector('script'),null);
+  assert.ok(!fragment.includes('|')); assert.ok(markdown.startsWith('| Code |\n| --- |')); f.dom.window.close(); parsed.window.close();
+});
 test('math source is recovered from rendered inline and display expressions', () => {
   const f = fixture('<p>Use <span class="math"><mjx-container><span>x</span></mjx-container></span>.</p><div class="math-block"><mjx-container display="true"><span>y</span></mjx-container></div>');
   annotateMath(f.body, 'Use $x^2$.\n\n\\[y = 1\\]');

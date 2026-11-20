@@ -1,5 +1,30 @@
 // Interface text only. Conversation content and model prompts are never translated here.
 const replacements = [
+  ['删除转换结果', 'Delete conversion result'],
+  ['转换结果已删除。', 'Conversion result deleted.'],
+  ['复制文本块', 'Copy block text'],
+  ['本地没有所请求的 arXiv 版本：', 'The requested arXiv version is unavailable locally: '],
+  ['本地文件未标记版本，无法核实所请求的 arXiv 版本：', 'The local file has no version marker. The requested arXiv version could not be verified: '],
+  ['此对话包含文件附件，请切换到 deepseek-flash 后继续。', 'This conversation includes a file attachment. Switch to deepseek-flash to continue.'],
+  ['松开以添加附件', 'Drop to attach files'],
+  ['待发送附件', 'Pending attachments'],
+  ['添加附件', 'Attach files'],
+  ['移除附件', 'Remove attachment'],
+  ['文件转 Markdown', 'File to Markdown'],
+  ['保存 Markdown', 'Save Markdown'],
+  ['正在上传附件…', 'Uploading attachment…'],
+  ['附件已暂存，发送时上传至 DeepSeek。', 'Attachment ready. It will be uploaded to DeepSeek when you send.'],
+  ['不支持此附件格式', 'Unsupported attachment format'],
+  ['转换完成，可以保存或复制 Markdown。', 'Conversion complete. Save or copy the Markdown.'],
+  ['正在完成渲染…', 'Finishing rendering…'],
+  ['该文献仅有 Markdown，建议补充 PDF 原件。', 'This reference has only Markdown. Consider adding the original PDF.'],
+  ['无可用 TeX，正在下载 PDF：', 'No usable TeX source. Downloading PDF: '],
+  ['本地副本', 'Local copy'],
+  ['检测到会话文件在外部删除，当前内容已另存为本地副本。', 'The conversation file was deleted externally. Its current contents were saved as a local copy.'],
+  ['检测到外部修改，当前对话已另存为本地副本，外部版本保留。', 'External changes were detected. This conversation was saved as a local copy; the external version was kept.'],
+  ['对话读取失败，原文件已保留。', 'Could not load the conversation. The original file was kept.'],
+  ['共享设置保存失败，请检查插件目录是否可写。', 'Could not save shared settings. Check that the plugin directory is writable.'],
+  ['对话记录超过本地存档大小上限，原文件已保留。', 'The conversation exceeds the local archive size limit. The original file was kept.'],
   ['Notebook 连接或目标单元格已变化，当前运行结果未写入，请重新运行', 'The Notebook connection or target cell changed; the current run result was not written. Run it again'],
   ['运行期间单元格输出已变化，旧运行结果未写入', 'The cell outputs changed during execution; the older result was not written'],
   ['运行结果已写入，但 Notebook 随后发生变化或未确认同步，请核对并重新运行', 'The result was written, but the Notebook changed afterward or synchronization was not confirmed. Check it and run again'],
@@ -382,7 +407,17 @@ const replacements = [
 replacements.sort((a, b) => b[0].length - a[0].length);
 function translate(text, language) {
   const source = String(text ?? '');
-  if (language !== 'en') return source;
+  if (language !== 'en') {
+    const fileMessages = {
+      'Enter a DeepSeek API key.': '请先填写 DeepSeek 密钥。',
+      'DeepSeek file request failed.': 'DeepSeek 文件请求失败。',
+      'DeepSeek returned an invalid file ID.': 'DeepSeek 返回的文件 ID 无效。',
+      'The file changed while being read. Attach it again.': '文件在读取期间发生变化，请重新附加。',
+      'A DeepSeek attachment has expired or is unavailable. Attach the original file again to continue.': 'DeepSeek 附件已过期或不可用，请重新附加原文件后继续。'
+    };
+    const size = /^File must be between 1 byte and (\d+) MiB\.$/.exec(source);
+    return fileMessages[source] || (size ? `文件大小须在 1 字节至 ${size[1]} MiB 之间。` : source);
+  }
   let result = source;
   for (const [original, english] of replacements) result = original.length === 1 ? (result === original ? english : result) : result.replaceAll(original, english);
   return result;

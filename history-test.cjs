@@ -2,7 +2,54 @@ const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { createHash } = require('node:crypto');
 const { copyMessage, sameMessage, repairOpenTools, rebuildEntryMessages } = require('./src/history');
+
+test('native file blocks and server page signatures survive archive reconstruction', () => {
+  const {validMessage}=require('./src/history');
+  const user={role:'user',content:[{type:'text',text:'Read it'},{type:'file',file_id:'file-api-example'}]};
+  const answer={role:'assistant',content:'Answer',reasoning_content:'Final',server_tool_calls:[{index:0,reasoning_content:'Earlier',calls:[{signature:'opaque',page:{url:'https://example.com'}}]}],annotations:[{type:'url_citation',url_citation:{url:'https://example.com'}}]};
+  for(const message of [user,answer]) {
+    assert.ok(validMessage(message));
+    const copy=copyMessage(message); assert.deepEqual(copy,message); assert.ok(sameMessage(copy,message));
+  }
+  const copy=copyMessage(answer);copy.server_tool_calls[0].calls[0].signature='changed';assert.equal(answer.server_tool_calls[0].calls[0].signature,'opaque');assert.equal(sameMessage(copy,answer),false);
+  assert.deepEqual(rebuildEntryMessages([{label:'你',raw:'Read it',modelMessages:[user]},{label:'deepseek-flash',raw:'Answer',modelMessages:[answer]}]),[user,answer]);
+  assert.equal(validMessage({role:'user',content:[{type:'file',file_id:'file-api-example',file_data:'base64'}]}),false);
+});
+
+test('deleting the first file reference reattaches its ID to the surviving referencing turn',()=>{
+  const file={id:'file-api-shared',name:'paper.pdf'};
+  const first={label:'你',raw:'First',files:[file],modelMessages:[{role:'user',content:[{type:'text',text:'First'},{type:'file',file_id:file.id}]}]};
+  const second={label:'你',raw:'Second',files:[file],modelMessages:[{role:'user',content:'Second'}]};
+  const both=rebuildEntryMessages([first,second]);
+  assert.equal(both[1].content,'Second');
+  const remaining=rebuildEntryMessages([second]);
+  assert.deepEqual(remaining[0].content,[{type:'text',text:'Second'},{type:'file',file_id:file.id}]);
+  assert.equal(second.modelMessages[0].content,'Second');
+});
 const { requestTimeContext } = require('./src/request-context');
+test('deleting the first library reference restores its TeX in a later file-bearing request', async () => {
+  const {ui} = require('./scripts/test-ui.cjs');
+  const library = require('./src/library');
+  const reference = 'Reference ID: paper\nTitle: Paper\nSource: source.tex\nReference text:\n\nUnique TeX statement';
+  const env = ui(async (_key,_messages,_signal,onText) => {
+    onText('OK'); return {prompt_tokens:200,completion_tokens:2};
+  }, async () => '', {libraryApi:{...library,expandMentions:async (text,root,key,signal,notify,parse,options) => {
+    options.materials.push(reference); return text+'\n\n'+reference;
+  }}});
+  await env.plugin.onload(); env.plugin.keys.deepseek = 'fake';
+  const view = env.plugin.factory({}); await view.onOpen();
+  view.input.value = 'First @[paper]'; await view.send();
+  const firstReply = view.session.entries[1];
+  const file = {name:'extra.txt',size:1,arrayBuffer:async () => Buffer.from('x')};
+  await view.uploadFiles([file]); view.input.value = 'Again @[paper]'; await view.send();
+  const original = view.session.entries[2].modelMessages[0];
+  assert.doesNotMatch(JSON.stringify(original),/Unique TeX statement/);
+  await view.deleteTurn(firstReply);
+  assert.match(view.messages[0].content[0].text,/Unique TeX statement/);
+  assert.equal(view.messages[0].content[1].file_id,original.content[1].file_id);
+  assert.doesNotMatch(JSON.stringify(original),/Unique TeX statement/);
+  await view.onClose();
+});
 const hash = text => createHash('sha256').update(text).digest('hex');
 const call = id => ({ id, type: 'function', function: { name: 'fetch_page', arguments: JSON.stringify({ url: 'https://example.com/' + id }) } });
 const reply = (id, content = '{}') => ({ role: 'tool', tool_call_id: id, content });

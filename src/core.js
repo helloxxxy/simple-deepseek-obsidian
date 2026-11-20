@@ -1,7 +1,6 @@
 const https = require('https');
 const { StringDecoder } = require('string_decoder');
 const { unzipSync, strFromU8 } = require('fflate');
-const { PDFDocument } = require('pdf-lib');
 const { imageMime, assertVisionImageSize, validateVisionImage, assertVisionRequestSize, safeVisionText, MAX_VISION_DIMENSION } = require('./vision');
 const { stripImageDataUris } = require('./text-safety');
 const { MAX_ERROR_BODY_BYTES, finishReasonInfo, parseServiceError, isAuthenticationFailure } = require('./service-errors');
@@ -93,11 +92,17 @@ function toolNames(tools) {
   if (tools == null) return new Set();
   if (!Array.isArray(tools)) throw new Error('工具定义格式异常');
   const names = new Set();
+  const serverNames = new Set();
   for (const tool of tools) {
+    if (['deepseek_web_search','deepseek_read_url'].includes(tool?.type)) {
+      if (serverNames.has(tool.type)) throw new Error('工具定义格式异常');
+      serverNames.add(tool.type); continue;
+    }
     const name = tool?.function?.name;
     if (tool?.type !== 'function' || typeof name !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(name) || names.has(name)) throw new Error('工具定义格式异常');
     names.add(name);
   }
+  if (serverNames.size && names.size) throw new Error('Server web tools and client function tools require separate requests.');
   return names;
 }
 function sseParser(onText, onThinking = () => {}, options = {}) {
@@ -105,6 +110,7 @@ function sseParser(onText, onThinking = () => {}, options = {}) {
   const registered = toolNames(options.tools);
   const calls = new Map();
   let buffer = '', done = false, reason = null, usage = null, totalArgumentCharacters = 0;
+  let serverCalls = null, annotations = null, stepThinking = '';
   const callSnapshot = () => [...calls].sort(([left], [right]) => left - right).map(([, call]) => ({ id: call.id, type: call.type, function: { ...call.function } }));
   const invalidTools = () => Object.assign(new Error('工具调用响应不完整或格式异常，未执行任何工具'), { category: 'tool_calls', incomplete: true, retryable: false, toolCalls: callSnapshot(), ...(reason ? { finishReason: reason } : {}) });
   const appendCalls = deltas => {
@@ -149,9 +155,24 @@ function sseParser(onText, onThinking = () => {}, options = {}) {
         throw isAuthenticationFailure(json.error) ? markAuthExpired(error, 'deepseek') : error;
       }
       const choice = json.choices?.[0];
-      if (typeof choice?.delta?.reasoning_content === 'string') onThinking(choice.delta.reasoning_content);
+      if (typeof choice?.delta?.reasoning_content === 'string') { stepThinking += choice.delta.reasoning_content; onThinking(choice.delta.reasoning_content); }
       if (typeof choice?.delta?.content === 'string') onText(choice.delta.content);
       if (choice?.delta?.tool_calls != null) appendCalls(choice.delta.tool_calls);
+      if (choice?.server_tool_event) {
+        const progress = choice.server_tool_event;
+        if (progress.type === 'step_reasoning_done') stepThinking = '';
+        options.onServerToolEvent?.(progress);
+      }
+      if (choice?.delta?.server_tool_calls !== undefined) {
+        if (!Array.isArray(choice.delta.server_tool_calls)) throw new Error('Invalid server tool response.');
+        serverCalls = choice.delta.server_tool_calls;
+        options.onServerToolCalls?.(serverCalls, {reasoningContent:stepThinking});
+      }
+      if (choice?.delta?.annotations !== undefined) {
+        if (!Array.isArray(choice.delta.annotations)) throw new Error('Invalid citation response.');
+        annotations = choice.delta.annotations;
+        options.onAnnotations?.(annotations);
+      }
       if (choice?.finish_reason) reason = choice.finish_reason;
     }
     if (buffer.length > MAX_MD) throw new Error('流式响应过大');
@@ -160,6 +181,8 @@ function sseParser(onText, onThinking = () => {}, options = {}) {
     get usage() { return usage; },
     get finishReason() { return reason; },
     get toolCalls() { return callSnapshot(); },
+    get serverToolCalls() { return serverCalls; },
+    get annotations() { return annotations; },
     push(chunk) { buffer += decoder.write(chunk); consume(); },
     end() {
       buffer += decoder.end(); if (buffer.trim()) buffer += '\n\n'; consume();
@@ -183,8 +206,10 @@ function sseParser(onText, onThinking = () => {}, options = {}) {
 }
 async function chat(key, messages, signal, onText, http = request, options = {}) {
   let receiving = true;
-  const parser = sseParser(onText, options.onThinking, { tools: options.tools, onToolProgress:progress => { if (receiving && !signal?.aborted) options.onToolProgress?.(progress); } });
+  const forward = name => (...values) => { if (receiving && !signal?.aborted) options[name]?.(...values); };
+  const parser = sseParser(onText, options.onThinking, { tools: options.tools, onToolProgress:forward('onToolProgress'), onServerToolEvent:forward('onServerToolEvent'), onServerToolCalls:forward('onServerToolCalls'), onAnnotations:forward('onAnnotations') });
   if (options.responseFormat != null && (typeof options.responseFormat !== 'object' || options.responseFormat.type !== 'json_object')) throw new Error('JSON 输出格式设置异常');
+  if (options.responseFormat && options.tools?.some(tool => tool.type.startsWith('deepseek_'))) throw new Error('Server web tools require text output.');
   const reasoningEffort = ['low','high','max'].includes(options.reasoningEffort) ? options.reasoningEffort : 'low';
   const body = JSON.stringify({ model: options.model || MODEL, thinking: { type: 'enabled' }, reasoning_effort: reasoningEffort, stream: true, stream_options: { include_usage: true }, max_tokens: options.maxOutputTokens ?? MAX_OUTPUT_TOKENS, messages, ...(options.tools?.length ? { tools: options.tools } : {}), ...(options.responseFormat ? { response_format: { type: 'json_object' } } : {}) });
   if (messages.some(message => Array.isArray(message.content) && message.content.some(part => part.type === 'image_url' || part.type === 'file'))) assertVisionRequestSize(body);
@@ -229,7 +254,7 @@ function abortableTask(task, signal) {
 async function readVisionImage(file, signal, options = {}) {
   check(signal);
   assertVisionImageSize(file?.size);
-  const bytes = Buffer.from(await abortableTask(Promise.resolve().then(() => file.arrayBuffer()), signal)); check(signal);
+  const bytes = Buffer.from(await abortableTask(Promise.resolve().then(() => { check(signal); return file.arrayBuffer(); }), signal)); check(signal);
   if (bytes.length !== file.size) throw Error('图片读取不完整');
   const dimensions = await abortableTask(validateVisionImage(bytes, { signal, decodeDimensions: options.decodeDimensions }), signal);
   check(signal);
@@ -333,7 +358,7 @@ async function parseMineruFile(file, key, signal, progress, http, sleep) {
   progress('准备上传…');
   const job = await api('file-urls/batch', { files: [{ name: file.name, is_ocr: true }], model_version: 'vlm' });
   if (!job.batch_id || !job.file_urls?.[0]) throw new Error('MinerU 未返回上传地址');
-  let bytes = Buffer.from(await file.arrayBuffer()); check(signal);
+  let bytes = Buffer.from(await abortableTask(Promise.resolve().then(() => { check(signal); return file.arrayBuffer(); }), signal)); check(signal);
   progress('上传中…');
   await http(job.file_urls[0], { method: 'PUT', body: bytes, signal, maxBytes: 1024 * 1024 });
   bytes = null;
@@ -355,17 +380,25 @@ async function parseMineruFile(file, key, signal, progress, http, sleep) {
   }
   throw new Error('解析等待超过 20 分钟，请稍后重新上传');
 }
-async function parallelMap(items, limit, mapper) {
+async function parallelMap(items, limit, mapper, signal) {
+  check(signal);
   const results = new Array(items.length);
-  let cursor = 0;
+  const controller = new AbortController(), abort = () => controller.abort();
+  signal?.addEventListener('abort', abort, { once: true });
+  let cursor = 0, failure;
   const worker = async () => {
-    while (cursor < items.length) {
+    while (!controller.signal.aborted && cursor < items.length) {
       const index = cursor++;
-      results[index] = await mapper(items[index], index);
+      try { results[index] = await mapper(items[index], index, controller.signal); }
+      catch (error) { failure ||= error; controller.abort(); }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
-  return results;
+  try {
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+    check(signal);
+    if (failure) throw failure;
+    return results;
+  } finally { signal?.removeEventListener('abort', abort); }
 }
 async function parseMineruBatch(parts, key, signal, progress, http, sleep) {
   if (!parts.length || parts.length > MAX_BATCH_FILES) throw new Error('MinerU 单批分块数量必须为 1-50 个');
@@ -377,13 +410,13 @@ async function parseMineruBatch(parts, key, signal, progress, http, sleep) {
   if (!job.batch_id || !Array.isArray(job.file_urls) || job.file_urls.length !== parts.length) throw new Error('MinerU 未返回完整的批量上传地址');
   let uploaded = 0;
   progress(`正在并行上传 ${parts.length} 个 PDF 分块…`);
-  await parallelMap(parts, TRANSFER_CONCURRENCY, async (part, index) => {
-    await http(job.file_urls[index], { method: 'PUT', body: part.bytes, signal, maxBytes: 1024 * 1024 });
+  await parallelMap(parts, TRANSFER_CONCURRENCY, async (part, index, batchSignal) => {
+    await http(job.file_urls[index], { method: 'PUT', body: part.bytes, signal: batchSignal, maxBytes: 1024 * 1024 });
     part.bytes = null;
-    check(signal);
+    check(batchSignal);
     uploaded++;
     progress(`并行上传中 ${uploaded}/${parts.length} 个分块…`);
-  });
+  }, signal);
   const findItem = (items, part) => items.find(item => item.data_id === part.dataId) || items.find(item => item.file_name === part.name);
   const deadline = Date.now() + 20 * 60 * 1000;
   let finished;
@@ -407,19 +440,20 @@ async function parseMineruBatch(parts, key, signal, progress, http, sleep) {
   if (!finished) throw new Error('解析等待超过 20 分钟，请稍后重新上传');
   let downloaded = 0;
   progress(`正在并行获取 ${parts.length} 个 Markdown 结果…`);
-  return parallelMap(parts, TRANSFER_CONCURRENCY, async (part, index) => {
+  return parallelMap(parts, TRANSFER_CONCURRENCY, async (part, index, batchSignal) => {
     const item = finished[index];
     if (!item?.full_zip_url) throw new Error(`MinerU 第 ${part.index + 1} 个分块未返回结果包`);
-    const zip = await http(item.full_zip_url, { signal });
-    check(signal);
+    const zip = await http(item.full_zip_url, { signal: batchSignal });
+    check(batchSignal);
     const md = markdownFromZip(zip);
     downloaded++;
     progress(`正在获取 Markdown ${downloaded}/${parts.length}…`);
     return md;
-  });
+  }, signal);
 }
 async function pdfPart(document, start, end, signal) {
   check(signal);
+  const { PDFDocument } = require('pdf-lib');
   const part = await PDFDocument.create();
   const pages = await part.copyPages(document, Array.from({ length: end - start }, (_, index) => start + index));
   for (const page of pages) part.addPage(page);
@@ -431,14 +465,18 @@ function partName(name, index, start, end) {
   return `${base}.part-${String(index).padStart(3, '0')}.pages-${start + 1}-${end}.pdf`;
 }
 async function parsePdf(file, key, signal, progress, http, sleep) {
+  check(signal);
   progress('正在读取 PDF 页数…');
   let bytes;
-  try { bytes = Buffer.from(await file.arrayBuffer()); } catch { throw new Error('无法读取 PDF 文件'); }
+  try { bytes = Buffer.from(await abortableTask(Promise.resolve().then(() => { check(signal); return file.arrayBuffer(); }), signal)); }
+  catch (error) { if (error?.name === 'AbortError') throw error; throw new Error('无法读取 PDF 文件'); }
   check(signal);
   if (!bytes.length) throw new Error('文件不能为空');
+  const { PDFDocument } = require('pdf-lib');
   let document;
   try { document = await PDFDocument.load(bytes, { updateMetadata: false }); }
   catch { throw new Error('无法读取 PDF 页数；文件可能损坏、加密或受密码保护'); }
+  check(signal);
   const pages = document.getPageCount();
   if (!pages) throw new Error('PDF 没有可解析的页面');
   if (pages <= MAX_PDF_PAGES && bytes.length <= MAX_FILE) {
@@ -453,6 +491,7 @@ async function parsePdf(file, key, signal, progress, http, sleep) {
     check(signal);
     const range = queue.shift();
     let part = await pdfPart(document, range.start, range.end, signal);
+    check(signal);
     if (part.length > MAX_FILE) {
       if (range.end - range.start === 1) throw new Error(`第 ${range.start + 1} 页单独拆分后仍超过 200 MB，无法提交 MinerU`);
       const middle = range.start + Math.floor((range.end - range.start) / 2);
@@ -482,6 +521,7 @@ async function parsePdf(file, key, signal, progress, http, sleep) {
   return merged;
 }
 async function parseFile(file, key, signal, progress = () => {}, http = request, sleep = pause) {
+  check(signal);
   if (!/\.(pdf|png|jpg|jpeg|jp2|webp|gif|bmp)$/i.test(file.name)) throw new Error('请选择 PDF 或支持的图片文件');
   if (!Number.isFinite(file.size) || file.size <= 0) throw new Error('文件不能为空');
   if (/\.pdf$/i.test(file.name)) return parsePdf(file, key, signal, progress, http, sleep);

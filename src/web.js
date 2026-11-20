@@ -80,15 +80,38 @@ function extractWebMentions(text) {
   return result;
 }
 
+const originalHistoryCache = new WeakMap();
+function messageText(message) {
+  if (typeof message?.content === 'string') return message.content;
+  return Array.isArray(message?.content) ? message.content.filter(part => part?.type === 'text' && typeof part.text === 'string').map(part => part.text).join('\n') : '';
+}
+function originalMessage(message, cache) {
+  const text = messageText(message), role = message?.role;
+  if (!message || typeof message !== 'object') return {text,markers:new Set(),verified:new Map()};
+  let cached = cache.get(message);
+  if (cached && cached.text === text && cached.role === role) return cached;
+  cached = {text,role,markers:new Set(),verified:new Map()};
+  for (const match of text.matchAll(/\[Web reference sha256:([0-9a-f]{64})\]/g)) cached.markers.add(match[1]);
+  if (role === 'tool' && text) {
+    let data; try { data = JSON.parse(text); } catch {}
+    for (const item of Array.isArray(data?.results) ? data.results : [data]) {
+      if (typeof item?.hash === 'string' && typeof item.content === 'string' && contentHash(item.content) === item.hash) cached.verified.set(item.hash,item.content);
+    }
+  }
+  cache.set(message,cached);
+  return cached;
+}
 function hasOriginal(messages, content, hash) {
-  const marker = referenceMarker(hash);
+  let history = originalHistoryCache.get(messages);
+  if (!history || history.messages.length !== messages.length || history.messages.some((message,index) => message !== messages[index])) {
+    history = {messages:messages.slice(),cache:new Map(messages.map(message => [message,history?.cache.get(message)]))};
+    originalHistoryCache.set(messages,history);
+  }
+  const canonicalHash = typeof hash === 'string' && /^[0-9a-f]{64}$/.test(hash);
   for (const message of messages) {
-    const text = typeof message?.content === 'string' ? message.content : '';
-    if (text.includes(marker) && text.includes(content)) return true;
-    if (message?.role !== 'tool' || !text) continue;
-    let data; try { data = JSON.parse(text); } catch { continue; }
-    const entries = Array.isArray(data?.results) ? data.results : [data];
-    if (entries.some(item => item?.hash === hash && item.content === content && contentHash(item.content) === hash)) return true;
+    const cached = originalMessage(message,history.cache);
+    if ((canonicalHash ? cached.markers.has(hash) : cached.text.includes(referenceMarker(hash))) && cached.text.includes(content)) return true;
+    if (cached.verified.has(hash) && cached.verified.get(hash) === content) return true;
   }
   return false;
 }
@@ -100,7 +123,7 @@ class WebReferences {
     this.now = now;
     this.responses = new Map(); this.materials = new Set(); this.selections = new Map();
     this._retainedMaterials = []; this.retainedKeys = new Set();
-    this.history = this.existingMessages.map(message => ({ message, content: message.content }));
+    this.history = this.existingMessages.map(message => ({ message, content: messageText(message) }));
   }
   get retainedMaterials() { return this._retainedMaterials.slice(); }
   retain(reference) {
@@ -112,9 +135,9 @@ class WebReferences {
   refreshMaterials() {
     // Pending references may be shared before the caller appends a result. Once
     // history changes, only text actually retained there can suppress a result.
-    if (this.history.length !== this.existingMessages.length || this.history.some((item, index) => item.message !== this.existingMessages[index] || item.content !== this.existingMessages[index].content)) {
+    if (this.history.length !== this.existingMessages.length || this.history.some((item, index) => item.message !== this.existingMessages[index] || item.content !== messageText(this.existingMessages[index]))) {
       this.materials.clear();
-      this.history = this.existingMessages.map(message => ({ message, content: message.content }));
+      this.history = this.existingMessages.map(message => ({ message, content: messageText(message) }));
     }
   }
   async response(name, args) {

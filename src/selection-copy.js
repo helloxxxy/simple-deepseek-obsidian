@@ -43,11 +43,15 @@ function fence(text, language = '') {
   const marker = backtickFence(text);
   return marker + language + '\n' + text.replace(/\n$/, '') + '\n' + marker;
 }
-function inlineCode(text) {
+function inlineCode(text, table = false) {
   if (!text) return '';
+  if (table && /\\+\|/.test(text)) {
+    const entities = {'&':'&amp;','<':'&lt;','>':'&gt;','|':'&#124;','\\':'&#92;'};
+    return '<code>' + text.replace(/\n/g,' ').replace(/[&<>|\\]/g,char => entities[char]) + '</code>';
+  }
   const marker = backtickFence(text, 1);
   const pad = /^`|`$/.test(text) || (/^ .* $/.test(text) && text.trim()) ? ' ' : '';
-  return marker + pad + text.replace(/\n/g, ' ') + pad + marker;
+  return marker + pad + text.replace(/\n/g, ' ').replace(/\|/g,table ? '\\|' : '|') + pad + marker;
 }
 function destination(value) {
   return value.replace(/[\\()\s]/g, character => /\s/.test(character) ? encodeURIComponent(character) : '\\' + character);
@@ -59,7 +63,7 @@ function serialize(node, range, context = {}) {
     return context.literal ? text : escapeText(text.replace(/[\t\r\n ]+/g, ' '));
   }
   if (node.nodeType !== 1 || node.matches(IGNORED) || node.hidden) return '';
-  const children = childContext => [...node.childNodes].map(child => serialize(child, range, childContext || context)).join('');
+  const children = childContext => [...node.childNodes].map(child => serialize(child, range, childContext ? {...context,...childContext} : context)).join('');
   if (node.matches(MATH)) {
     const source = mathSource(node);
     if (source) return source.startsWith('$$') ? block(source) : source;
@@ -74,7 +78,7 @@ function serialize(node, range, context = {}) {
     const language = /(?:^|\s)language-([^\s]+)/.exec(className)?.[1] || '';
     return block(fence(text, language));
   }
-  if (tag === 'code') return context.literal ? children() : inlineCode(children({ literal: true }));
+  if (tag === 'code') return context.literal ? children() : inlineCode(children({ literal: true }),context.table);
   if (tag === 'strong' || tag === 'b') return inline(children(), '**');
   if (tag === 'em' || tag === 'i') return inline(children(), '*');
   if (tag === 'del' || tag === 's') return inline(children(), '~~');
@@ -113,8 +117,8 @@ function serialize(node, range, context = {}) {
   }
   if (tag === 'table') {
     const rows = [...node.querySelectorAll('tr')].filter(row => row.closest('table') === node);
-    const selected = rows.map(row => [...row.children].filter(cell => /^(TH|TD)$/.test(cell.tagName)).map(cell => serialize(cell, range, context).trim().replace(/\n+/g, '<br>')));
-    const width = Math.max(0, ...selected.map(row => row.length));
+    const selected = rows.map(row => [...row.children].filter(cell => /^(TH|TD)$/.test(cell.tagName)).map(cell => serialize(cell, range, {...context,table:true}).trim().replace(/\n+/g, '<br>').replace(/(\\*)\|/g,(_,slashes) => slashes + (slashes.length % 2 ? '|' : '\\|'))));
+    const width = selected.reduce((width,row) => Math.max(width,row.length),0);
     if (!width || !selected.some(row => row.some(Boolean))) return '';
     const line = row => '| ' + Array.from({ length: width }, (_, i) => row[i] || '').join(' | ') + ' |';
     const header = rows[0]?.querySelector('th') ? selected.shift() : [];

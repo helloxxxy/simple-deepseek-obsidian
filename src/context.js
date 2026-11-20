@@ -20,6 +20,7 @@ Distinguish staged Notebook edits awaiting confirmation from applied edits. Pres
 If an earlier checkpoint exists, merge its still-relevant facts with later messages instead of copying it. Omit repetition and superseded decisions. For source documents too large to retain, keep their identifiers and established findings; say when an unpreserved detail must be read again. Output only the checkpoint, with as much detail as needed and no chronological recap.`;
 // A preflight estimate, not an exact model tokenizer. API usage takes precedence.
 function estimateText(text) {
+  if (typeof text !== 'string') text = JSON.stringify(text ?? '');
   let ascii = 0, other = 0;
   for (const char of text) { if (char.charCodeAt(0) < 128) ascii++; else other++; }
   return Math.ceil(ascii * 0.3 + other * 0.6);
@@ -29,7 +30,7 @@ function estimateMessages(messages, { includeReasoning = true } = {}) {
   return messages.reduce((sum, message) => {
     let cached = messageEstimateCache.get(message);
     if (!cached || !sameMessage(message,cached.snapshot)) {
-      const calls = message.tool_calls ? JSON.stringify(message.tool_calls) : '';
+      const calls = (message.tool_calls ? JSON.stringify(message.tool_calls) : '') + (message.server_tool_calls ? JSON.stringify(message.server_tool_calls) : '');
       cached = { snapshot:copyMessage(message), tokens:estimateText(message.content || '') + estimateText(calls) + estimateText(message.tool_call_id || ''), reasoningTokens:estimateText(message.reasoning_content || '') };
       messageEstimateCache.set(message, cached);
     }
@@ -39,15 +40,42 @@ function estimateMessages(messages, { includeReasoning = true } = {}) {
 function meterMatches(meter, metadata = {}) {
   return !!meter && (!metadata.model || meter.model === metadata.model) && (!metadata.systemPrompt || meter.systemPrompt === metadata.systemPrompt) && (meter.includeReasoning !== false) === (metadata.includeReasoning !== false);
 }
+function hasUpperBound(session, metadata = {}) {
+  const meter = session.meter;
+  return !!meter?.upperBound && meter.count <= session.messages.length && (!metadata.model || meter.model === metadata.model);
+}
 function contextTokens(session, metadata = {}) {
   const meter = session.meter;
+  if (hasUpperBound(session,metadata)) {
+    const promptGrowth = Math.max(0,estimateText(metadata.systemPrompt || meter.systemPrompt || SYSTEM_PROMPT)-estimateText(meter.systemPrompt || SYSTEM_PROMPT));
+    return meter.tokens + promptGrowth + (session.messages.length > meter.count ? estimateMessages(session.messages.slice(meter.count),metadata) : 0);
+  }
   if (meterMatches(meter, metadata) && meter.count <= session.messages.length) {
     return meter.tokens + (session.messages.length > meter.count ? estimateMessages(session.messages.slice(meter.count), metadata) : 0);
   }
   return estimateMessages([{role:'system',content:metadata.systemPrompt || SYSTEM_PROMPT}, ...session.messages], metadata);
 }
+function requestInputTokens(session, extra = 0, metadata = {}) {
+  const meter = session.meter;
+  // Summed server-step billing bounds context size but cannot establish that a
+  // request exceeds the window. Use observable content for that feasibility check.
+  if (hasUpperBound(session,metadata)) return estimateMessages([{role:'system',content:metadata.systemPrompt || SYSTEM_PROMPT},...session.messages],metadata) + extra;
+  const tokens = contextTokens(session, metadata) + extra;
+  // Usage includes the preceding request's tool schema. Keep that measurement
+  // intact; only the next request's budget adjusts its schema contribution.
+  const knownSchema = value => Number.isSafeInteger(value?.schemaTokens) && value.schemaTokens >= 0 && typeof value.schemaHash === 'string' && (value.schemaTokens === 0 ? value.schemaHash === '' : /^[0-9a-f]{64}$/.test(value.schemaHash));
+  if (!meterMatches(meter,metadata) || meter.count > session.messages.length || !knownSchema(meter) || !knownSchema(metadata)) return tokens;
+  const previousSchema = meter.schemaHash === metadata.schemaHash ? metadata.schemaTokens : meter.schemaTokens;
+  return Math.max(0,tokens - previousSchema);
+}
 function rememberUsage(session, usage, metadata = {}) {
   if (usage && Number.isFinite(usage.prompt_tokens) && Number.isFinite(usage.completion_tokens)) {
+    if (metadata.aggregateUsage) {
+      const localTokens = estimateMessages([{role:'system',content:metadata.systemPrompt || SYSTEM_PROMPT},...session.messages],metadata);
+      const retainedMetadata = {...metadata}; delete retainedMetadata.aggregateUsage;
+      session.meter = {tokens:Math.max(localTokens,usage.prompt_tokens + usage.completion_tokens),count:session.messages.length,estimated:true,upperBound:true,...retainedMetadata};
+      return;
+    }
     const reasoning = usage.completion_tokens_details?.reasoning_tokens;
     const omittedReasoning = metadata.includeReasoning === false && Number.isFinite(reasoning) && reasoning >= 0 ? Math.min(usage.completion_tokens, reasoning) : 0;
     session.meter = { tokens: usage.prompt_tokens + usage.completion_tokens - omittedReasoning, count: session.messages.length, estimated: false, ...metadata };
@@ -64,19 +92,22 @@ function recordCacheUsage(session, usage) {
 function sessionStats(session, language = 'zh', metadata = {}) {
   const tokens = session.messages.length ? contextTokens(session, metadata) : 0;
   const approximate = !!session.messages.length && (!meterMatches(session.meter, metadata) || session.meter.estimated || session.meter.count !== session.messages.length);
+  const upperBound = !!session.messages.length && hasUpperBound(session,metadata);
   const cache = session.cache || { hit: 0, miss: 0, measured: 0, unknown: 0 };
   const denominator = cache.hit + cache.miss;
   const en = language === 'en';
   const ratio = denominator ? (cache.hit / denominator * 100).toFixed(1) + '%' : (en ? 'n/a' : '暂无数据');
   const partial = cache.unknown ? (en ? ' (reported requests only)' : '（仅已返回统计的请求）') : '';
-  const parts = [en ? 'Context ' : '上下文 ', (approximate ? (en ? '~' : '约 ') : '') + (tokens / USAGE_BASE * 100).toFixed(1) + '%', ' · ', en ? 'Total cache hit ' : '缓存总命中率 ', ratio, partial];
+  const prefix = upperBound ? '≤ ' : approximate ? (en ? '~' : '约 ') : '';
+  const boundNote = upperBound ? (en ? ' Upper bound from billed inference steps; actual context may be smaller. Automatic compression may start early.' : ' 按计费推理步骤估算上界，实际上下文可能更小，自动压缩可能提前触发。') : '';
+  const parts = [en ? 'Context ' : '上下文 ', prefix + (tokens / USAGE_BASE * 100).toFixed(1) + '%', ' · ', en ? 'Total cache hit ' : '缓存总命中率 ', ratio, partial];
   if (en) return {
     parts,
-    text: 'Context ' + (approximate ? '~' : '') + (tokens / USAGE_BASE * 100).toFixed(1) + '% · Total cache hit ' + ratio + partial,
-    detail: 'Context: ' + (approximate ? 'estimated ' : '') + tokens.toLocaleString('en-US') + ' / 1,000,000 tokens. Cache hits ' + cache.hit.toLocaleString('en-US') + ', misses ' + cache.miss.toLocaleString('en-US') + ' tokens; ' + cache.measured + ' requests reported usage, ' + cache.unknown + ' did not. Includes chat, compression, and image recognition requests.'
+    text: 'Context ' + prefix + (tokens / USAGE_BASE * 100).toFixed(1) + '% · Total cache hit ' + ratio + partial,
+    detail: 'Context: ' + (approximate ? 'estimated ' : '') + tokens.toLocaleString('en-US') + ' / 1,000,000 tokens.' + boundNote + ' Cache hits ' + cache.hit.toLocaleString('en-US') + ', misses ' + cache.miss.toLocaleString('en-US') + ' tokens; ' + cache.measured + ' requests reported usage, ' + cache.unknown + ' did not. Includes chat, compression, and image recognition requests.'
   };
-  return { parts, text: '上下文 ' + (approximate ? '约 ' : '') + (tokens / USAGE_BASE * 100).toFixed(1) + '% · 缓存总命中率 ' + ratio + partial,
-    detail: '上下文：' + (approximate ? '估算 ' : '') + tokens.toLocaleString('en-US') + ' / 1,000,000 tokens。缓存累计命中 ' + cache.hit.toLocaleString('en-US') + '，未命中 ' + cache.miss.toLocaleString('en-US') + ' tokens；有统计请求 ' + cache.measured + '，无统计请求 ' + cache.unknown + '。包括普通对话、压缩和图片识别请求。' };
+  return { parts, text: '上下文 ' + prefix + (tokens / USAGE_BASE * 100).toFixed(1) + '% · 缓存总命中率 ' + ratio + partial,
+    detail: '上下文：' + (approximate ? '估算 ' : '') + tokens.toLocaleString('en-US') + ' / 1,000,000 tokens。' + boundNote + '缓存累计命中 ' + cache.hit.toLocaleString('en-US') + '，未命中 ' + cache.miss.toLocaleString('en-US') + ' tokens；有统计请求 ' + cache.measured + '，无统计请求 ' + cache.unknown + '。包括普通对话、压缩和图片识别请求。' };
 }
 function formatUsage(usage, durationMs = 0, language = 'zh') {
   if (!usage) return language === 'en' ? 'Usage unavailable' : '服务端未返回用量';
@@ -89,20 +120,24 @@ function formatUsage(usage, durationMs = 0, language = 'zh') {
 function contextReserve(capabilities = {}) { return Math.min(4096, Math.max(1, Math.floor((capabilities.contextWindow || CONTEXT_WINDOW) / 20))); }
 function outputBudget(session, extra = 0, capabilities = {}, metadata = {}) {
   // Leave space for the compression instruction even after a very long response.
-  const remaining = (capabilities.contextWindow || CONTEXT_WINDOW) - contextTokens(session, metadata) - extra - contextReserve(capabilities);
+  const remaining = (capabilities.contextWindow || CONTEXT_WINDOW) - requestInputTokens(session, extra, metadata) - contextReserve(capabilities);
   if (remaining < 1) throw Error('本轮输入和现有上下文仍超过可用空间，请缩小引用或选择更短范围');
   return Math.min(capabilities.maxOutputTokens || MAX_OUTPUT_TOKENS, remaining);
 }
-async function compactContext(session, key, signal, notify, send = chat, extra = 0, force = false, systemPrompt = SYSTEM_PROMPT, capabilities = {}, model = '', includeReasoning = true) {
+async function compactContext(session, key, signal, notify, send = chat, extra = 0, force = false, systemPrompt = SYSTEM_PROMPT, capabilities = {}, model = '', includeReasoning = true, requestSchema = null) {
   const metadata = { ...(model ? { model } : {}), systemPrompt, includeReasoning };
   const contextWindow = capabilities.contextWindow || CONTEXT_WINDOW;
-  const before = contextTokens(session, model ? metadata : { includeReasoning });
-  if (!session.messages.length || (!force && before + extra < COMPACT_AT)) return null;
+  const measuredMetadata = model ? metadata : {includeReasoning};
+  const before = contextTokens(session, measuredMetadata);
+  const nextInput = requestSchema ? requestInputTokens(session,extra,{...measuredMetadata,...requestSchema}) : before + extra;
+  const upperBoundReached = hasUpperBound(session,measuredMetadata) && before + extra >= COMPACT_AT;
+  if (!session.messages.length || (!force && nextInput < COMPACT_AT && !upperBoundReached)) return null;
   check(signal);
   const snapshot = session.messages.map(copyMessage);
   const requestHistory = includeReasoning ? snapshot : snapshot.map(message => { const copy = copyMessage(message); delete copy.reasoning_content; return copy; });
   const instructionTokens = estimateText(COMPRESSION_PROMPT) + estimateText(COMPRESSION_SYSTEM_PROMPT) + 40;
-  const budget = Math.min(65536, capabilities.maxOutputTokens || MAX_OUTPUT_TOKENS, contextWindow - before - instructionTokens - Math.min(1024, Math.max(1, Math.floor(contextWindow / 50))));
+  const compressionInput = requestInputTokens(session,0,{...measuredMetadata,schemaTokens:0,schemaHash:''});
+  const budget = Math.min(65536, capabilities.maxOutputTokens || MAX_OUTPUT_TOKENS, contextWindow - compressionInput - instructionTokens - Math.min(1024, Math.max(1, Math.floor(contextWindow / 50))));
   if (budget < 1) throw new Error('上下文已超过压缩请求可用空间；原会话已保留，请手动精简超大的单次输入。');
   notify('正在压缩上下文');
   check(signal);
@@ -126,7 +161,8 @@ async function compactContext(session, key, signal, notify, send = chat, extra =
   const entry = {role:'user',content:'Continuation checkpoint from earlier turns; use it as background, not as a new request:\n\n' + summary};
   const estimated = estimateMessages([{role:'system',content:systemPrompt},entry], { includeReasoning });
   const after = estimated;
-  if (after >= before || after >= COMPACT_AT) throw new Error('摘要没有有效缩短上下文，原上下文已保留。');
+  const measuredInput = Number.isFinite(usage?.prompt_tokens) ? Math.max(0,usage.prompt_tokens - instructionTokens) : compressionInput;
+  if (after >= (session.meter?.upperBound ? measuredInput : compressionInput) || after >= COMPACT_AT) throw new Error('摘要没有有效缩短上下文，原上下文已保留。');
   // Atomic replacement: never discard the original on failures, cancellations or stale requests.
   check(signal);
   if (session.messages.length !== snapshot.length || session.messages.some((m,i)=>!sameMessage(m,snapshot[i]))) throw new Error('会话已变化，本次摘要未替换原上下文。');
@@ -135,4 +171,4 @@ async function compactContext(session, key, signal, notify, send = chat, extra =
   session.compactions = (session.compactions || 0) + 1;
   return {summary,before,after,usage};
 }
-module.exports = {COMPACT_AT,CONTEXT_WINDOW,SYSTEM_PROMPT,COMPRESSION_PROMPT,estimateText,estimateMessages,contextTokens,rememberUsage,contextReserve,outputBudget,compactContext,formatUsage,recordCacheUsage,sessionStats,USAGE_BASE};
+module.exports = {COMPACT_AT,CONTEXT_WINDOW,SYSTEM_PROMPT,COMPRESSION_PROMPT,estimateText,estimateMessages,contextTokens,requestInputTokens,rememberUsage,contextReserve,outputBudget,compactContext,formatUsage,recordCacheUsage,sessionStats,USAGE_BASE};

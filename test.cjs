@@ -260,23 +260,16 @@ test('MinerU Markdown ZIP filters embedded image payloads while preserving text,
   assert.deepEqual(archive,before);
 });
 
-test('uploaded PDF text removes wrapped image payloads before selection, rendering and context archival',async()=>{
-  const line='A'.repeat(76),payload='data:image/png;base64,'+Array(12).fill(line).concat('TQ==').join('\n  ');
-  const extracted='# Paper\n\n$x^2$ and \\[y=2\\]\n![figure](figures/plot.png)\n\n'+payload+'\n\nKeep this explanation.';
-  const original=Buffer.from('%PDF-source'),file={name:'paper.pdf',size:original.length,arrayBuffer:async()=>original};
-  const env=ui(async()=>{},async()=>extracted);await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();env.plugin.keys.mineru='key';
-  let selected='';view.selectTextRange=async text=>{selected=text;return text;};
-  await view.upload(file);
-  for(const text of [selected,...env.renders.map(render=>render.text),JSON.stringify(view.session),JSON.stringify([...env.conversationState.values()])]){assert.ok(!text.includes(line));assert.ok(!text.includes('TQ=='));assert.ok(!text.includes('data:image/'));}
-  assert.ok(selected.includes('![figure](figures/plot.png)'));assert.ok(selected.includes('$x^2$'));assert.ok(selected.includes('Keep this explanation.'));
-  assert.deepEqual(original,Buffer.from('%PDF-source'));assert.ok(extracted.includes(payload));
-  assert.ok(view.session.messages[0].content.includes('Keep this explanation.'));await view.onClose();
+test('explicit MinerU conversion strips inline image bytes and keeps its result outside chat context',async()=>{
+ const payload='data:image/png;base64,'+'A'.repeat(600),extracted='# Paper\n\n$x^2$\n![figure](figures/plot.png)\n'+payload+'\nKeep this explanation.';
+ const env=ui(async()=>assert.fail('conversion needs no chat'),async()=>extracted);await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();env.plugin.keys.mineru='key';
+ await view.run(signal=>view.uploadPdf(pdfFile,'key',signal));assert.match(view.session.entries[0].raw,/Keep this explanation/);assert.ok(!JSON.stringify(view.session).includes(payload));assert.equal(view.messages.length,0);assert.equal(view.session.entries[0].modelMessages.length,0);await view.onClose();
 });
 
 test('UI: expired keys open each official API page once during the cooldown',async()=>{
   const expired=service=>{const error=Error(`${service} expired`);error.authExpired=true;error.authService=service;return error;};
   const env=ui(async()=>{throw expired('deepseek');},async()=>{throw expired('mineru');});const{plugin,opened}=env;await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys={deepseek:'fake',mineru:'fake'};
-  view.input.value='one';await view.send();view.input.value='two';await view.send();await view.upload(pdfFile);await view.upload(pdfFile);
+  view.input.value='one';await view.send();view.input.value='two';await view.send();await view.run(signal=>view.uploadPdf(pdfFile,'fake',signal));await view.run(signal=>view.uploadPdf(pdfFile,'fake',signal));
   assert.deepEqual(opened,['https://platform.deepseek.com/api_keys','https://mineru.net/apiManage']);await view.onClose();
 });
 test('clear button confirms system recycling and leaves the conversation intact on cancel',async()=>{
@@ -482,83 +475,46 @@ test('automatic compression resends full Notebook content before advancing the d
   const notebook={cells:[{id:'one',cell_type:'code',source:'print(42)',outputs:[]}]};
   let sent;
   const env=ui(async(_key,messages,_signal,delta)=>{
-    if(messages.at(-1).content.includes('压缩')) {delta('short summary');return{completion_tokens:2};}
+    if(messages.at(-1).content===ctx.COMPRESSION_PROMPT) {delta('short summary');return{completion_tokens:2};}
     sent=messages.at(-1).content;delta('done');return{prompt_tokens:100,completion_tokens:2};
   },async()=>{});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
   view.notebookClient={read:()=>notebook,close(){}};view.notebookMode=true;view.notebookAttach.value='delta';
   const snapshot=notebookApi.notebookSnapshot(notebook);view.notebookSnapshot=snapshot;view.session.notebookSnapshot=snapshot;
   view.messages.push({role:'user',content:'old'.repeat(5000)+notebookApi.notebookContext(notebookApi.notebookDelta(notebook,null))});
-  view.session.meter={tokens:800000,count:1,estimated:true,model:env.plugin.model,systemPrompt:notebookApi.NOTEBOOK_SYSTEM_PROMPT};view.input.value='继续';
+  view.session.meter={tokens:800000,count:1,estimated:true,model:env.plugin.model,...view.requestMetadata()};view.input.value='继续';
   await view.send();
   assert.ok(sent?.includes('print(42)'));assert.ok(sent.includes('"previousHash":null'));
   assert.equal(view.notebookSnapshot?.hash,snapshot.hash);assert.match(view.notebookAttachLabel.textContent,/待发 0 格/);
   await view.onClose();
 });
-test('dropped image waits for Send, hides recognition text in UI, and keeps base64 out of saved context',async()=>{
-  let seen, pdfCalls=0, visionCalls=0;
-  const image={name:'paper-figure.png',size:8,arrayBuffer:async()=>Buffer.from([137,80,78,71,13,10,26,10])};
-  const env=ui(async(_key,messages,_signal,delta)=>{seen=messages;delta('The plot rises.');return{completion_tokens:4};},async()=>{pdfCalls++;return 'PDF markdown';},{
-    describeImage:async()=>{visionCalls++;return 'Panel A: x is time; y rises.';}
-  });
-  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
-  assert.equal(view.dropZone.hidden,true);
-  const enter=new env.dom.window.Event('dragenter',{bubbles:true,cancelable:true});view.dropZone.parentElement.dispatchEvent(enter);
-  assert.equal(view.dropZone.hidden,false);
-  const drop=new env.dom.window.Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:{files:[image]}});
-  view.dropZone.parentElement.dispatchEvent(drop);await new Promise(resolve=>setTimeout(resolve,30));
-  assert.equal(view.dropZone.hidden,true);
-  assert.equal(visionCalls,0);assert.equal(pdfCalls,0);assert.equal(view.pendingImages.length,1);
-  assert.ok(!view.feed.textContent.includes('Panel A:'));
-  assert.equal(env.plugin.session.messages.length,0);
-  assert.ok(!JSON.stringify(env.plugin.session).includes('base64,'));
-  env.plugin.keys.mineru='fake';await view.upload({name:'paper.pdf',size:4,arrayBuffer:async()=>Buffer.from('%PDF')});
-  assert.equal(pdfCalls,1);assert.ok(view.feed.textContent.includes('PDF markdown'));
-  view.input.value='这图说明什么？';await view.send();
-  assert.equal(visionCalls,1);assert.equal(view.pendingImages.length,0);
-  assert.ok(seen.some(message=>typeof message.content==='string'&&message.content.includes('Panel A: x is time')));
-  assert.ok(!view.feed.textContent.includes('Panel A:'));assert.equal(env.plugin.session.entries.find(entry=>entry.label==='你').images[0].name,'paper-figure.png');
-  await env.plugin.saveQueue;assert.ok(!JSON.stringify([...env.conversationState.values()]).includes('base64,'));
-  await view.onClose();
+test('dropped image and PDF wait for Send and reach DeepSeek as file IDs without auxiliary recognition',async()=>{
+ let seen;const env=ui(async(_key,messages,_signal,delta)=>{seen=messages;delta('Answer');},()=>assert.fail('chat must not call MinerU'),{describeImage:()=>assert.fail('no auxiliary recognition')});
+ await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
+ const drop=new env.dom.window.Event('drop',{bubbles:true,cancelable:true});Object.defineProperty(drop,'dataTransfer',{value:{files:[attachedImage('figure.png'),pdfFile]}});view.dropZone.parentElement.dispatchEvent(drop);await new Promise(setImmediate);
+ assert.equal(view.pendingFiles.length,2);assert.equal(env.fileUploads.length,0);assert.equal(view.messages.length,0);view.input.value='Compare';await view.send();
+ assert.equal(env.fileUploads.length,2);assert.equal(seen.at(-1).content.filter(block=>block.type==='file').length,2);assert.equal(view.pendingFiles.length,0);assert.equal(view.session.entries[0].files.length,2);assert.ok(!JSON.stringify(view.session).includes('base64,'));await view.onClose();
 });
-test('pending image notice follows interface language without translating filenames or hidden descriptions',async()=>{
-  const env=ui(async(k,m,s,d)=>d('Answer'),async()=>{}, {saved:{uiLanguage:'en'},describeImage:async()=> '图中的横轴是时间。'});
-  await env.plugin.onload();env.plugin.keys.deepseek='test-key';const view=env.plugin.factory({});await view.onOpen();
-  await view.upload({name:'figure.png',size:8,arrayBuffer:async()=>Buffer.from([137,80,78,71,13,10,26,10])});
-  await new Promise(setImmediate);assert.match(view.status.textContent,/Image attached/);assert.equal(view.pendingImageList.textContent,'figure.png');
-  assert.equal(view.pendingImageList.querySelector('button').getAttribute('aria-label'),'Remove image');
-  env.plugin.uiLanguage='zh';view.refreshLanguage();await new Promise(setImmediate);
-  assert.match(view.status.textContent,/图片已暂存/);assert.equal(view.pendingImageList.querySelector('button').getAttribute('aria-label'),'移除图片');
-  env.plugin.uiLanguage='en';view.refreshLanguage();await new Promise(setImmediate);
-  assert.match(view.status.textContent,/Image attached/);view.input.value='Explain';await view.send();assert.match(view.messages[0].content,/图中的横轴是时间。/);
-  assert.ok(!view.feed.textContent.includes('图中的横轴'));assert.equal(view.session.entries[0].images[0].name,'figure.png');
-  await view.onClose();
+
+test('pending attachment notice and remove control follow interface language',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),async()=>'',{saved:{uiLanguage:'en',webEnabled:false}});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage('figure.png'));
+ await new Promise(setImmediate);assert.match(view.status.textContent,/attachment|attached/i);assert.match(view.pendingImageList.textContent,/figure.png/);assert.equal(view.pendingImageList.querySelector('button').getAttribute('aria-label'),'Remove attachment');
+ env.plugin.uiLanguage='zh';view.refreshLanguage();await new Promise(setImmediate);assert.match(view.status.textContent,/附件/);assert.equal(view.pendingImageList.querySelector('button').getAttribute('aria-label'),'移除附件');view.pendingImageList.querySelector('button').click();assert.equal(view.pendingFiles.length,0);await view.onClose();
 });
-test('Ctrl+V stages clipboard images and parses PDFs while ordinary text remains a normal paste',async()=>{
-  let imageCalls=0,pdfCalls=0;
-  const env=ui(async()=>{},async()=>{pdfCalls++;return '# PDF text';},{describeImage:async()=>{imageCalls++;return 'Figure A: rising curve';}});
-  await env.plugin.onload();env.plugin.keys={deepseek:'fake',mineru:'fake'};const view=env.plugin.factory({});await view.onOpen();view.input.value='draft';
-  const png={name:'',type:'image/png',size:8,arrayBuffer:async()=>Buffer.from([137,80,78,71,13,10,26,10])};
-  const pasteImage=new env.dom.window.Event('paste',{bubbles:true,cancelable:true});
-  Object.defineProperty(pasteImage,'clipboardData',{value:{files:[],items:[{kind:'file',getAsFile:()=>png}]}});
-  view.input.dispatchEvent(pasteImage);await new Promise(resolve=>setTimeout(resolve,30));
-  assert.ok(pasteImage.defaultPrevented);assert.equal(imageCalls,0);assert.equal(view.input.value,'draft');assert.equal(view.pendingImages.length,1);
-  assert.equal(env.plugin.session.messages.length,0);
-  const pdf={name:'paper.pdf',type:'application/pdf',size:4,arrayBuffer:async()=>Buffer.from('%PDF')};
-  const pastePdf=new env.dom.window.Event('paste',{bubbles:true,cancelable:true});Object.defineProperty(pastePdf,'clipboardData',{value:{files:[pdf],items:[]}});
-  view.input.dispatchEvent(pastePdf);await new Promise(resolve=>setTimeout(resolve,30));
-  assert.ok(pastePdf.defaultPrevented);assert.equal(pdfCalls,1);assert.ok(view.feed.textContent.includes('# PDF text'));
-  const plain=new env.dom.window.Event('paste',{bubbles:true,cancelable:true});Object.defineProperty(plain,'clipboardData',{value:{files:[],items:[],getData:()=> 'hello'}});
-  view.input.dispatchEvent(plain);assert.equal(plain.defaultPrevented,false);
-  await view.send();assert.equal(imageCalls,1);assert.ok(env.plugin.session.messages.some(message=>message.content.includes('Figure A: rising curve')));
-  await view.onClose();
+
+test('Ctrl+V stages images and PDFs until Send and leaves text paste alone',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),()=>assert.fail('no MinerU'));await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();view.input.value='draft';
+ const png={...attachedImage(''),type:'image/png'};for(const attached of [png,{...pdfFile,type:'application/pdf'}]){const paste=new env.dom.window.Event('paste',{bubbles:true,cancelable:true});Object.defineProperty(paste,'clipboardData',{value:{files:[attached],items:[]}});view.input.dispatchEvent(paste);await new Promise(setImmediate);assert.ok(paste.defaultPrevented);}
+ assert.equal(view.pendingFiles.length,2);assert.equal(env.fileUploads.length,0);assert.equal(view.input.value,'draft');const plain=new env.dom.window.Event('paste',{bubbles:true,cancelable:true});Object.defineProperty(plain,'clipboardData',{value:{files:[],items:[],getData:()=> 'hello'}});view.input.dispatchEvent(plain);assert.equal(plain.defaultPrevented,false);
+ await view.send();assert.equal(env.fileUploads.length,2);assert.equal(view.messages[0].content.filter(block=>block.type==='file').length,2);await view.onClose();
 });
+
 test('UI: native renderer receives normalized math; copy preserves Markdown; context keeps original',async()=>{
   const calls=[];const env=ui(async(k,msg,s,delta)=>{calls.push(msg);delta('**回答** $x$');},async()=> '# 文本\n\\(a=b\\)');
   const{plugin,doc,renders,copies}=env;await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys={deepseek:'fake',mineru:'fake'};
-  await view.upload(pdfFile);assert.ok(doc.querySelector('h1'));assert.ok(renders.some(r=>r.text==='# 文本\n$a=b$'));
-  doc.querySelector('.sd-message-head button').click();await Promise.resolve();assert.equal(copies[0],'# 文本\n$a=b$');
-  view.input.value='总结';await view.send();assert.ok(calls[0].some(m=>m.content.includes('\\(a=b\\)')));assert.ok(renders.some(r=>r.text==='**回答** $x$'));
+  await view.run(signal=>view.uploadPdf(pdfFile,'fake',signal));assert.ok(doc.querySelector('h1'));assert.ok(renders.some(r=>r.text==='# 文本\n$a=b$'));
+  doc.querySelector('.sd-message-head button').click();await Promise.resolve();assert.equal(copies[0],'# 文本\n\\(a=b\\)');
+  view.input.value='总结';await view.send();assert.ok(!calls[0].some(m=>JSON.stringify(m.content).includes('a=b')));assert.ok(renders.some(r=>r.text==='**回答** $x$'));
   await view.clear();assert.equal(view.messages.length,0);assert.equal(doc.querySelectorAll('.sd-message').length,0);assert.equal(view.children.size,0);await view.onClose();
 });
 test('rendered text selection copies local Markdown and pauses replacement until deselected',async()=>{
@@ -589,7 +545,7 @@ test('selection started during an asynchronous Markdown render survives the pend
 test('private settings: load credentials and keep them out of shared data',async()=>{
   const{plugin,doc,saved}=ui(async()=>{},async()=>'',{keyState:{deepseek:'ds-old',mineru:'mu-old',libraryPath:'C:/local-lib'},saved:{messages:['should not load'],libraryPath:'shared-leak'}});
   await plugin.onload();const view=plugin.factory({});await view.onOpen();assert.equal(doc.querySelector('input').value,'ds-old');assert.equal(view.messages.length,0);
-  assert.equal(plugin.libraryPath,'C:/local-lib');assert.equal(saved.length,0);plugin.keys.deepseek='ds-new';plugin.keys.unwanted='never save';await plugin.saveKeys();assert.deepEqual(saved.at(-1),{displayTokensPerSecond:0,model:'deepseek-flash',reasoningEffort:'low',webEnabled:true,uiLanguage:'en'});assert.ok(!JSON.stringify(saved).includes('local-lib'));await view.clear();assert.equal(plugin.keys.deepseek,'ds-new');await view.onClose();
+  assert.equal(plugin.libraryPath,'C:/local-lib');assert.equal(saved.length,0);plugin.keys.deepseek='ds-new';plugin.keys.unwanted='never save';await plugin.saveKeys();assert.deepEqual(saved.at(-1),{model:'deepseek-flash',reasoningEffort:'low',webEnabled:true,uiLanguage:'en'});assert.ok(!JSON.stringify(saved).includes('local-lib'));await view.clear();assert.equal(plugin.keys.deepseek,'ds-new');await view.onClose();
 });
 test('keys: input change autosaves and survives a fresh plugin instance',async()=>{
   const{plugin,doc,dom,saved,keyState}=ui(async()=>{},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();
@@ -625,22 +581,21 @@ test('math: nested protected code in links is restored and numeric formulas conv
   assert.equal(normalizeMath('plain x + y = z'), 'plain x + y = z');
 });
 test('math: mixed inline and display stays distinct through rendering and copying',async()=>{
-  const{plugin,doc,renders,copies}=ui(async()=>{},async()=> '正文 \\(x+1\\) 然后\n\\[x^2+y^2=z^2\\]');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.mineru='fake';await view.upload(pdfFile);
-  const expected='正文 $x+1$ 然后\n$$x^2+y^2=z^2$$';assert.ok(renders.some(r=>r.text===expected));doc.querySelector('.sd-message-head button').click();await Promise.resolve();assert.equal(copies[0],expected);await view.onClose();
+  const{plugin,doc,renders,copies}=ui(async()=>{},async()=> '正文 \\(x+1\\) 然后\n\\[x^2+y^2=z^2\\]');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.mineru='fake';await view.run(signal=>view.uploadPdf(pdfFile,'fake',signal));
+  const expected='正文 $x+1$ 然后\n$$x^2+y^2=z^2$$';assert.ok(renders.some(r=>r.text===expected));doc.querySelector('.sd-message-head button').click();await Promise.resolve();assert.equal(copies[0],'正文 \\(x+1\\) 然后\n\\[x^2+y^2=z^2\\]');await view.onClose();
 });
 test('chat prompt keeps reference trust boundary without formatting instructions',async()=>{
-  let prompt;const{plugin}=ui(async(k,m,s,delta)=>{prompt=m[0].content;delta('ok');},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.deepseek='fake';view.input.value='hello';await view.send();assert.equal(prompt,require('./src/context').SYSTEM_PROMPT);assert.ok(!prompt.includes('$'));await view.onClose();
+  let prompt;const{plugin}=ui(async(k,m,s,delta)=>{prompt=m[0].content;delta('ok');},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.deepseek='fake';view.input.value='hello';await view.send();assert.equal(prompt,view.requestPrompt());assert.ok(!prompt.includes('$'));await view.onClose();
 });
 test('chat: official 393216 token output cap, full context, no short total timeout',async()=>{
   const messages=[{role:'user',content:'old'},{role:'assistant',content:'old answer'},{role:'user',content:'new'}];
   await core.chat('fake',messages,signal(),()=>{},async(url,opts)=>{const body=JSON.parse(opts.body);assert.equal(body.max_tokens,393216);assert.deepEqual(body.messages,messages);assert.equal(opts.timeoutMs,0);assert.equal(opts.idleTimeoutMs,600000);opts.onChunk(Buffer.from(event('done')+stopEvent+'data: [DONE]\n\n'));});
 });
-test('context: reopen restores all messages, attachments and transcript, clear resets session',async()=>{
-  const calls=[];const{plugin,doc}=ui(async(k,m,s,delta)=>{calls.push(m);delta('');delta('answer');},async()=> '# Document');await plugin.onload();plugin.keys={deepseek:'fake',mineru:'fake'};
-  const first=plugin.factory({});await first.onOpen();await first.upload(pdfFile);first.input.value='first question';await first.send();assert.equal(first.messages.length,3);await first.onClose();
-  const second=plugin.factory({});await second.onOpen();assert.equal(second.messages.length,3);assert.equal(doc.querySelectorAll('.sd-message').length,3);second.input.value='follow up';await second.send();assert.ok(calls[1].some(m=>m.content.includes('# Document')));assert.ok(calls[1].some(m=>m.content==='first question'));assert.ok(calls[1].some(m=>m.content==='answer'));assert.equal(second.messages.length,5);
-  await second.clear();assert.equal(plugin.session.messages.length,0);assert.equal(plugin.session.entries.length,0);await second.onClose();
+test('context: reopening restores native file IDs and transcript while clear resets both',async()=>{
+ const calls=[];const env=ui(async(k,m,s,d)=>{calls.push(structuredClone(m));d('answer');},()=>assert.fail('no MinerU'));const{plugin}=env;await plugin.onload();plugin.keys.deepseek='key';let view=plugin.factory({});await view.onOpen();await view.upload(pdfFile);view.input.value='First question';await view.send();assert.equal(view.messages.length,2);const id=view.messages[0].content[1].file_id;await view.onClose();
+ view=plugin.factory({});await view.onOpen();assert.equal(view.messages[0].content[1].file_id,id);view.input.value='Follow up';await view.send();assert.equal(calls[1].filter(message=>Array.isArray(message.content)).length,1);assert.equal(env.fileUploads.length,1);await view.clear();assert.equal(view.messages.length,0);assert.equal(view.session.entries.length,0);await view.onClose();
 });
+
 test('context: interrupted answer is available for a follow-up after reopening',async()=>{
   let count=0,seen;const{plugin}=ui(async(k,m,s,delta)=>{if(++count===1){delta('partial text');throw Error('network');}seen=m;delta('continued');},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const first=plugin.factory({});await first.onOpen();first.input.value='question';await first.send();await first.onClose();const next=plugin.factory({});await next.onOpen();next.input.value='continue';await next.send();assert.ok(seen.some(m=>m.content==='partial text'));await next.onClose();
 });
@@ -687,27 +642,27 @@ test('UI: crossing threshold makes one model compression call; transcript stays 
   view.input.value='followup';await view.send();assert.ok(calls[2].some(m=>m.content.includes('compressed memory')));assert.ok(!calls[2].some(m=>m.content==='full answer'));await view.onClose();
 });
 test('UI: compression before send keeps pending text if compression fails',async()=>{
-  const{plugin}=ui(async()=>{throw Error('network');},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:800000,count:1,model:plugin.model,systemPrompt:ctx.SYSTEM_PROMPT};view.input.value='pending';await view.send();assert.equal(view.input.value,'pending');assert.equal(plugin.session.messages[0].content,'old');await view.onClose();
+  const{plugin}=ui(async()=>{throw Error('network');},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:800000,count:1,model:plugin.model,...view.requestMetadata()};view.input.value='pending';await view.send();assert.equal(view.input.value,'pending');assert.equal(plugin.session.messages[0].content,'old');await view.onClose();
 });
 test('UI: oversized context is rejected before the API request and keeps the draft',async()=>{
   let calls=0;const{plugin}=ui(async()=>{calls++;},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();
-  plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:ctx.CONTEXT_WINDOW-1000,count:1,model:plugin.model,systemPrompt:ctx.SYSTEM_PROMPT};view.compress=async()=>null;
+  plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:ctx.CONTEXT_WINDOW-1000,count:1,model:plugin.model,...view.requestMetadata()};view.compress=async()=>null;
   view.input.value='pending question';await view.send();assert.equal(calls,0);assert.equal(view.input.value,'pending question');assert.equal(plugin.session.messages.length,1);assert.match(view.status.textContent,/超过可用空间/);await view.onClose();
 });
 test('UI: clearing during compression prevents late summary and resets token meter',async()=>{
-  let release;const{plugin,doc}=ui(async(k,m,s,d)=>{d('summary');await new Promise(r=>release=r);return{completion_tokens:100};},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:800000,count:1,model:plugin.model,systemPrompt:ctx.SYSTEM_PROMPT};view.input.value='pending';const pending=view.send();await new Promise(setImmediate);await view.clear();release();await pending;assert.equal(plugin.session.messages.length,0);assert.equal(plugin.session.meter,null);assert.equal(doc.querySelectorAll('.sd-message').length,0);await view.onClose();
+  let release;const{plugin,doc}=ui(async(k,m,s,d)=>{d('summary');await new Promise(r=>release=r);return{completion_tokens:100};},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();plugin.session.messages.push({role:'user',content:'old'});plugin.session.meter={tokens:800000,count:1,model:plugin.model,...view.requestMetadata()};view.input.value='pending';const pending=view.send();await new Promise(setImmediate);await view.clear();release();await pending;assert.equal(plugin.session.messages.length,0);assert.equal(plugin.session.meter,null);assert.equal(doc.querySelectorAll('.sd-message').length,0);await view.onClose();
 });
 test('usage: length-limited completion carries measured usage for the next compression check',async()=>{
   await assert.rejects(core.chat('fake',[],signal(),()=>{},async(url,opts)=>{opts.onChunk(Buffer.from('data: '+JSON.stringify({choices:[{delta:{content:'partial'},finish_reason:'length'}],usage:{prompt_tokens:799999,completion_tokens:2}})+'\n\ndata: [DONE]\n\n'));}),error=>error.usage.prompt_tokens===799999&&error.usage.completion_tokens===2);
 });
 test('UI: usage from a truncated answer is retained for compression on the next send',async()=>{
-  const{plugin}=ui(async(k,m,s,d)=>{d('partial');const error=Error('length');error.usage={prompt_tokens:799999,completion_tokens:2};throw error;},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';await view.send();assert.equal(ctx.contextTokens(plugin.session),800001);await view.onClose();
+  const{plugin}=ui(async(k,m,s,d)=>{d('partial');const error=Error('length');error.usage={prompt_tokens:799999,completion_tokens:2};throw error;},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';await view.send();assert.equal(ctx.contextTokens(plugin.session,view.requestMetadata()),800001);await view.onClose();
 });
 test('cache: ordinary turns preserve exact message prefix and original formula text',async()=>{
   const requests=[];const answers=['first\n\n\\(x^2\\)  ', 'second\n```js\nx=1\n```', 'third'];
   const{plugin}=ui(async(k,m,s,d)=>{requests.push(JSON.parse(JSON.stringify(m)));d(answers[requests.length-1]);return{prompt_tokens:100,completion_tokens:10,prompt_cache_hit_tokens:80,prompt_cache_miss_tokens:20};},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();
   for(const q of ['user 1\nnext line','user 2','user 3']){view.input.value=q;await view.send();}
-  assert.deepEqual(requests[1].slice(0,requests[0].length),requests[0]);assert.deepEqual(requests[2].slice(0,requests[1].length),requests[1]);assert.equal(requests[1][2].content,answers[0]);assert.equal(requests[2][4].content,answers[1]);assert.equal(requests[0][0].content,ctx.SYSTEM_PROMPT);await view.onClose();
+  assert.deepEqual(requests[1].slice(0,requests[0].length),requests[0]);assert.deepEqual(requests[2].slice(0,requests[1].length),requests[1]);assert.equal(requests[1][2].content,answers[0]);assert.equal(requests[2][4].content,answers[1]);assert.equal(requests[0][0].content,view.requestPrompt());await view.onClose();
 });
 test('cache: hit tokens still occupy context and missing usage is not reported as zero',()=>{
   const session=largeSession(10);ctx.rememberUsage(session,{prompt_tokens:799990,prompt_cache_hit_tokens:799990,prompt_cache_miss_tokens:0,completion_tokens:10});assert.equal(ctx.contextTokens(session),800000);
@@ -759,7 +714,7 @@ test('pacing: cancellation wakes both an empty queue and a queue waiting to disp
 });
 test('pacing UI: entire reply is received and retained before stopping slow local display',async()=>{
   const full='中文'.repeat(1000);const{plugin,doc,copies}=ui(async(k,m,s,d)=>{d(full);return{prompt_tokens:100,completion_tokens:1000,prompt_cache_hit_tokens:80,prompt_cache_miss_tokens:20};},async()=>'',{pacingRate:50});await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';const pending=view.send();await new Promise(setImmediate);
-  assert.equal(plugin.session.messages[1].content,full);assert.equal(plugin.session.meter.tokens,1100);assert.ok(doc.querySelectorAll('.sd-body')[1].textContent.length<full.length);assert.ok(view.status.textContent.includes('回复已接收完毕'));assert.equal(doc.querySelector('[aria-label="立即显示"]'),null);doc.querySelectorAll('.sd-message-head button')[1].click();await Promise.resolve();assert.equal(copies.at(-1),full);assert.equal(view.sendButton.textContent,'停止');view.sendButton.click();await pending;assert.equal(view.sendButton.textContent,'发送');assert.equal(plugin.session.messages[1].content,full);await view.onClose();
+  assert.equal(plugin.session.messages[1].content,full);assert.equal(plugin.session.meter.tokens,1100);assert.ok(doc.querySelectorAll('.sd-body')[1].textContent.length<full.length);assert.ok(view.status.textContent.includes('正在完成渲染'));assert.equal(doc.querySelector('[aria-label="立即显示"]'),null);doc.querySelectorAll('.sd-message-head button')[1].click();await Promise.resolve();assert.equal(copies.at(-1),full);assert.equal(view.sendButton.textContent,'停止');view.sendButton.click();await pending;assert.equal(view.sendButton.textContent,'发送');assert.equal(plugin.session.messages[1].content,full);await view.onClose();
 });
 test('pacing UI: clearing during local drain discards queue and cannot recreate messages',async()=>{
   const{plugin,doc}=ui(async(k,m,s,d)=>d('中文'.repeat(1000)),async()=>'',{pacingRate:50});await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';const pending=view.send();await new Promise(setImmediate);await view.clear();await pending;assert.equal(doc.querySelectorAll('.sd-message').length,0);assert.equal(plugin.session.messages.length,0);assert.equal(view.controller,null);await view.onClose();
@@ -767,19 +722,14 @@ test('pacing UI: clearing during local drain discards queue and cannot recreate 
 test('pacing UI: closing mid-display retains all received text for reopening',async()=>{
   const full='中文'.repeat(1000);const{plugin,doc}=ui(async(k,m,s,d)=>d(full),async()=>'',{pacingRate:50});await plugin.onload();plugin.keys.deepseek='fake';let view=plugin.factory({});await view.onOpen();view.input.value='question';const pending=view.send();await new Promise(setImmediate);await view.onClose();await pending;assert.equal(plugin.session.entries[1].raw,full);view=plugin.factory({});await view.onOpen();assert.equal(doc.querySelectorAll('.sd-body')[1].textContent,full);await view.onClose();
 });
-test('pacing setting: default unlimited, selectable rate persists without conversation data',async()=>{
-  const{plugin,doc,dom,saved}=ui(async()=>{},async()=> '');await plugin.onload();assert.equal(plugin.displayTokensPerSecond,0);const view=plugin.factory({});await view.onOpen();const select=doc.querySelector('input[type="range"]');select.value='100';select.dispatchEvent(new dom.window.Event('change'));await plugin.saveQueue;assert.equal(saved.at(-1).displayTokensPerSecond,100);assert.deepEqual(Object.keys(saved.at(-1)).sort(),['displayTokensPerSecond','model','reasoningEffort','uiLanguage','webEnabled']);const next=ui(async()=>{},async()=>'',{saved:saved.at(-1)});await next.plugin.onload();assert.equal(next.plugin.displayTokensPerSecond,100);await view.onClose();
+test('output speed is unlimited and omitted from shared settings',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),async()=>'',{saved:{uiLanguage:'en',displayTokensPerSecond:50}});await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();assert.equal(env.plugin.displayTokensPerSecond,0);assert.equal(env.doc.querySelector('.sd-speed'),null);await env.plugin.saveKeys();assert.equal(env.saved.at(-1).displayTokensPerSecond,undefined);await view.onClose();
 });
 
-test('smooth UI: speed shares actions and frame text does not call native renderer',async()=>{
- const {plugin,doc,renders}=ui(async()=>{},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();
- assert.ok(doc.querySelector('.sd-actions .sd-speed input[type="range"]'));assert.equal(doc.querySelectorAll('.simple-deepseek > .sd-speed').length,0);
- const row=view.row('DeepSeek');clearTimeout(row.timer);row.timer=null;row.streaming=true;
- const before=renders.length;
- for(let i=1;i<=80;i++)view.revealDelta(row,'中文');
- assert.equal(renders.length,before);assert.equal(row.body.textContent,'中文'.repeat(80));
- row.streaming=false;row.version++;await view.render(row);assert.equal(row.body.textContent,'中文'.repeat(80));await view.onClose();
+test('compact composer omits speed controls and keeps lightweight text updates',async()=>{
+ const env=ui(async()=>{},async()=> '');await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();assert.equal(env.doc.querySelector('.sd-speed'),null);const state=view.row('DeepSeek');const count=env.renders.length;view.revealDelta(state,'Visible immediately');assert.equal(state.body.textContent,'Visible immediately');assert.equal(env.renders.length,count);await view.onClose();
 });
+
 test('smooth UI: native snapshot can finish while newer frame text stays visible',async()=>{
  let release;const {plugin}=ui(async()=>{},async()=>'',{render:async()=>new Promise(r=>release=r)});await plugin.onload();const view=plugin.factory({});await view.onOpen();
  const row=view.row('DeepSeek');clearTimeout(row.timer);row.timer=null;row.streaming=true;
@@ -821,11 +771,17 @@ test('local pacing can reduce frame cadence without changing configured tokens p
   assert.ok(frames>5&&frames<30);assert.ok(sleeps>=frames);
 });
 
-test('smooth UI: timed pacing updates text and stops promptly without animation-frame polling',async()=>{
+test('smooth UI: timed pacing updates text and stops promptly without animation-frame polling',{timeout:5000},async()=>{
  const {plugin,dom}=ui(async(k,m,s,d)=>d('中'.repeat(1000)),async()=>'',{pacingRate:50});let requested=0;
  dom.window.requestAnimationFrame=()=>{requested++;throw Error('animation frame polling is unnecessary');};
- await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='hello';const pending=view.send();await new Promise(r=>setTimeout(r,60));
- assert.ok([...view.rows].at(-1).body.textContent.length>0);assert.equal(requested,0);const stopped=Date.now();await view.clear();await pending;assert.ok(Date.now()-stopped<1000);await view.onClose();
+ await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='hello';const pending=view.send();
+ await new Promise(resolve=>{
+   const observer=new dom.window.MutationObserver(()=>{
+     if ([...view.rows].at(-1)?.body.textContent.includes('中')) {observer.disconnect();resolve();}
+   });
+   observer.observe(view.feed,{subtree:true,childList:true,characterData:true});
+ });
+ assert.equal(requested,0);const stopped=Date.now();await view.clear();await pending;assert.ok(Date.now()-stopped<1000);await view.onClose();
 });
 
 test('stream tail: appends within final paragraph without a separate block',async()=>{
@@ -854,15 +810,10 @@ test('stream tail: semantic endings keep text outside links and math internals',
  await view.onClose();
 });
 
-test('slider: linear integer speeds update live and far-right unlimited persists',async()=>{
- const {plugin,doc,dom,saved}=ui(async()=>{},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();const slider=doc.querySelector('input[type="range"]');
- assert.equal(slider.min,'20');assert.equal(slider.max,'301');assert.equal(slider.step,'1');
- for(const value of [20,21,73,110,199,200,299,300,301]){slider.value=String(value);slider.dispatchEvent(new dom.window.Event('input'));assert.equal(plugin.displayTokensPerSecond,value===301?0:value);assert.equal(slider.getAttribute('aria-valuetext'),value===301?'不限速':value+' t/s');}
- slider.dispatchEvent(new dom.window.Event('change'));await plugin.saveQueue;
- const restored=ui(async()=>{},async()=>'',{saved:saved.at(-1)});await restored.plugin.onload();assert.equal(restored.plugin.displayTokensPerSecond,0);
- for(const value of [20,73,200,300]){const env=ui(async()=>{},async()=>'',{saved:{displayTokensPerSecond:value}});await env.plugin.onload();assert.equal(env.plugin.displayTokensPerSecond,value);}
- await view.onClose();
+test('old saved speed values all restore unlimited rendering',async()=>{
+ for(const value of [20,73,200,300]){const env=ui(async()=>{},async()=>'',{saved:{displayTokensPerSecond:value}});await env.plugin.onload();assert.equal(env.plugin.displayTokensPerSecond,0);const view=env.plugin.factory({});await view.onOpen();assert.equal(env.doc.querySelector('.sd-speed input'),null);await view.onClose();}
 });
+
 test('copy: bottom button copies full received Markdown and survives reopen',async()=>{
  const {plugin,doc,copies}=ui(async()=>{},async()=> '');await plugin.onload();let view=plugin.factory({});await view.onOpen();
  const row=view.row('DeepSeek','visible');row.entry.raw='full **answer**';
@@ -873,7 +824,7 @@ test('copy: bottom button copies full received Markdown and survives reopen',asy
 test('model: editable name persists and reaches chat and compression requests',async()=>{
  const models=[];const {plugin,doc,dom,saved}=ui(async(k,m,s,d,h,o)=>{models.push(o.model);d('answer');return {prompt_tokens:10,completion_tokens:2};},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();plugin.keys.deepseek='fake';
  const input=doc.querySelector('.sd-model');input.value=' custom-model ';input.dispatchEvent(new dom.window.Event('change'));await plugin.saveQueue;assert.equal(saved.at(-1).model,'custom-model');
- view.input.value='hi';await view.send();plugin.session.meter={tokens:800000,count:plugin.session.messages.length,model:plugin.model,systemPrompt:ctx.SYSTEM_PROMPT};await view.compress('fake',signal());assert.deepEqual(models,['custom-model','custom-model']);
+ view.input.value='hi';await view.send();plugin.session.meter={tokens:800000,count:plugin.session.messages.length,model:plugin.model,...view.requestMetadata()};await view.compress('fake',signal());assert.deepEqual(models,['custom-model','custom-model']);
  const restored=ui(async()=>{},async()=>'',{saved:saved.at(-1)});await restored.plugin.onload();assert.equal(restored.plugin.model,'custom-model');await view.onClose();
 });
 test('model metadata pins per-turn limits, stays out of saved settings, and is reused for the next turn',async()=>{
@@ -916,32 +867,19 @@ test('small supported windows retain usable space and unsupported reasoning effo
   view.input.value='hi';await view.send();assert.equal(requests.length,0);assert.equal(view.input.value,'hi');assert.match(view.status.textContent,/不支持所选思考强度/);
   env.plugin.reasoningEffort='high';await view.send();assert.equal(requests.length,1);assert.equal(requests[0].maxOutputTokens,256);await view.onClose();
 });
-test('vision uses discovered Flash output limits independently of the chat model',async()=>{
-  let visionOptions;const env=ui(async()=>{},async()=>{}, {listModels:async()=>({data:[{id:'deepseek-flash',context_window:32768,max_output_tokens:1024,input_modalities:['text','image']}]}),describeImage:async(_file,_key,_signal,_progress,_send,opts)=>{visionOptions=opts;return 'Image text';}});
-  await env.plugin.onload();env.plugin.keys.deepseek='key';env.plugin.model='deepseek-v4-pro';const view=env.plugin.factory({});await view.onOpen();
-  await view.upload({name:'figure.png',size:8,arrayBuffer:async()=>Buffer.from([137,80,78,71,13,10,26,10])});assert.equal(visionOptions,undefined);view.input.value='Read this';await view.send();assert.equal(visionOptions.maxOutputTokens,1024);assert.equal(env.plugin.model,'deepseek-v4-pro');await view.onClose();
+test('native image question uses the selected Flash model and discovered output limit',async()=>{
+ let options;const env=ui(async(k,m,s,d,h,o)=>{options=o;assert.equal(m.at(-1).content[1].type,'file');d('Answer');},async()=>'',{listModels:async()=>({data:[{id:'deepseek-flash',context_window:32768,max_output_tokens:1024,input_modalities:['text','image']}]})});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read';await view.send();assert.equal(options.maxOutputTokens,1024);assert.equal(env.fileUploads.length,1);await view.onClose();
 });
-test('vision reserves question and multi-image input before allocating output tokens',async()=>{
-  let visionOptions,visionCalls=0;
-  const env=ui(async(_k,_m,_s,onText)=>onText('Answer'),async()=>'',{listModels:async()=>({data:[{id:'deepseek-flash',context_window:5000,max_output_tokens:5000,input_modalities:['text','image']}]}),visionSend:async(_k,_m,_s,onText,_h,options)=>{visionOptions=options;visionCalls++;onText('Two plots.');}});
-  await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();
-  const png=value=>{const bytes=Buffer.from([137,80,78,71,13,10,26,10,value]);return{name:value+'.png',size:bytes.length,arrayBuffer:async()=>bytes};};
-  await view.uploadFiles([png(1),png(2)]);view.input.value='Compare both curves.';await view.send();
-  assert.equal(visionCalls,1);assert.ok(visionOptions.maxOutputTokens>0);assert.ok(visionOptions.maxOutputTokens<5000-250-2048);
-  await view.upload(png(3));const draft='x'.repeat(30000);view.input.value=draft;await view.send();
-  assert.equal(visionCalls,1);assert.equal(view.input.value,draft);assert.equal(view.pendingImages.length,1);assert.match(view.status.textContent,/上下文空间不足/);await view.onClose();
+
+test('native attachment question preserves an oversized draft before generating',async()=>{
+ let calls=0;const env=ui(async(k,m,s,d)=>{calls++;d('Answer');},async()=>'',{listModels:async()=>({data:[{id:'deepseek-flash',context_window:5000,max_output_tokens:2000,input_modalities:['text','image']}]})});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());const draft='x'.repeat(30000);view.input.value=draft;await view.send();assert.equal(calls,0);assert.equal(view.input.value,draft);assert.equal(view.pendingFiles.length,1);assert.match(view.status.textContent,/单次输入超过|上下文空间不足/);await view.onClose();
 });
-test('image-only archived questions retain their visible prefix and deduplicate when history is rebuilt',async()=>{
-  const env=ui(async(_k,_m,_s,onText)=>onText('Answer'),async()=>'',{describeImage:async()=> 'ONE UNIQUE IMAGE DESCRIPTION'});
-  await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();
-  const bytes=Buffer.from([137,80,78,71,13,10,26,10,1]),image={name:'figure.png',size:bytes.length,arrayBuffer:async()=>bytes};
-  await view.upload(image);await view.send();await view.upload(image);await view.send();
-  const users=env.plugin.session.entries.filter(entry=>entry.label==='你');assert.equal(users.length,2);
-  assert.ok(users.every(entry=>entry.contextText.startsWith(entry.raw)));
-  const {rebuildEntryMessages}=require('./src/history');
-  assert.equal((JSON.stringify(rebuildEntryMessages(env.plugin.session.entries)).match(/ONE UNIQUE IMAGE DESCRIPTION/g)||[]).length,1);
-  assert.equal((JSON.stringify(rebuildEntryMessages(env.plugin.session.entries.slice(2))).match(/ONE UNIQUE IMAGE DESCRIPTION/g)||[]).length,1);await view.onClose();
+
+test('image-only requests preserve filenames and reuse one retained file reference',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),async()=> '');await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage('figure.png'));await view.send();await view.upload(attachedImage('figure.png'));await view.send();
+ const users=view.session.entries.filter(entry=>entry.label==='你');assert.equal(users.length,2);assert.ok(users.every(entry=>entry.raw==='figure.png'));assert.equal(env.fileUploads.length,1);assert.equal(view.messages.filter(message=>Array.isArray(message.content)).length,1);assert.ok(!JSON.stringify(view.session).includes('base64,'));await view.onClose();
 });
+
 test('model: core sends configured name',async()=>{
  await core.chat('fake',[],signal(),()=>{},async(url,opts)=>{assert.equal(JSON.parse(opts.body).model,'custom-model');opts.onChunk(Buffer.from(event('done')+stopEvent+'data: [DONE]\n\n'));},{model:'custom-model'});
 });
@@ -984,15 +922,15 @@ test('thinking SSE: reasoning and answer are delivered separately in order',asyn
  },{onThinking:s=>seen.push(['thinking',s])});assert.deepEqual(seen,[['thinking','思考'],['thinking','继续'],['answer','正文']]);
 });
 test('thinking UI: starts collapsed, can close after opening, and persists separately',async()=>{
- let answerNow;const calls=[];const {plugin,doc,dom,saved,conversationState}=ui(async(k,m,s,d,h,o)=>{calls.push(m);o.onThinking('reasoning text');await new Promise(r=>answerNow=()=>{d('answer text');r();});return{prompt_tokens:100,completion_tokens:20};},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';const pending=view.send();await new Promise(setImmediate);
+ let answerNow;const calls=[];const {plugin,doc,dom,saved,conversationState}=ui(async(k,m,s,d,h,o)=>{calls.push(m);o.onThinking('reasoning text');await new Promise(r=>answerNow=()=>{d('answer text');r();});return{prompt_tokens:100,completion_tokens:20};},async()=> '',{saved:{uiLanguage:'zh',webEnabled:true}});await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';const pending=view.send();await new Promise(setImmediate);
  const box=doc.querySelectorAll('.sd-thinking')[1];assert.equal(box.hidden,false);assert.equal(box.open,false);assert.equal(box.querySelector('.sd-thinking-body').textContent,'');box.open=true;box.dispatchEvent(new dom.window.Event('toggle'));await uiEventually(()=>box.querySelector('.sd-thinking-body').textContent==='reasoning text');box.open=false;box.dispatchEvent(new dom.window.Event('toggle'));assert.equal(box.querySelector('.sd-thinking-body').textContent,'');assert.equal(view.sendButton.textContent,'停止');
- answerNow();assert.equal(box.open,false);await pending;assert.equal(view.sendButton.textContent,'发送');assert.equal([...doc.querySelectorAll('.sd-actions button')].some(button=>button.textContent==='立即显示'||button.textContent==='停止'),false);assert.equal(plugin.session.messages[1].content,'answer text');assert.equal(plugin.session.entries[1].thinking,'reasoning text');assert.equal(plugin.session.meter.estimated,false);assert.equal(plugin.session.meter.tokens,120);assert.equal(plugin.session.messages[1].reasoning_content,'reasoning text');
+ answerNow();assert.equal(box.open,false);await pending;assert.equal(view.sendButton.textContent,'发送');assert.equal([...doc.querySelectorAll('.sd-actions button')].some(button=>button.textContent==='立即显示'||button.textContent==='停止'),false);assert.equal(plugin.session.messages[1].content,'answer text');assert.equal(plugin.session.entries[1].thinking,'reasoning text');assert.equal(plugin.session.meter.estimated,true);assert.ok(plugin.session.meter.tokens>=120);assert.equal(plugin.session.messages[1].reasoning_content,'reasoning text');
  const next=ui(async()=>{},async()=>'',{saved:saved.at(-1),conversationState});await next.plugin.onload();const reopened=next.plugin.factory({});await reopened.onOpen();const restoredBox=next.doc.querySelectorAll('.sd-thinking')[1];assert.equal(restoredBox.open,false);assert.equal(next.doc.querySelectorAll('.sd-thinking-body')[1].textContent,'');restoredBox.open=true;restoredBox.dispatchEvent(new next.dom.window.Event('toggle'));await uiEventually(()=>restoredBox.querySelector('.sd-thinking-body').textContent==='reasoning text');await reopened.onClose();await view.onClose();
 });
 test('context meter includes reasoning tokens retained for tool-enabled requests',async()=>{
- const {plugin}=ui(async(k,m,s,d,h,o)=>{o.onThinking('private reasoning');d('visible answer');return{prompt_tokens:100,completion_tokens:20,completion_tokens_details:{reasoning_tokens:15}};},async()=> '');
+ const {plugin}=ui(async(k,m,s,d,h,o)=>{o.onThinking('private reasoning');d('visible answer');return{prompt_tokens:100,completion_tokens:20,completion_tokens_details:{reasoning_tokens:15}};},async()=> '',{saved:{uiLanguage:'zh',webEnabled:true}});
  await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();view.input.value='question';await view.send();
- assert.deepEqual(JSON.parse(JSON.stringify(plugin.session.meter)),{tokens:120,count:2,estimated:false,model:plugin.model,systemPrompt:ctx.SYSTEM_PROMPT,includeReasoning:true});await view.onClose();
+ assert.equal(plugin.session.meter.includeReasoning,true);assert.equal(plugin.session.meter.upperBound,true);assert.ok(plugin.session.meter.tokens>=120);assert.equal(plugin.session.meter.systemPrompt,view.requestPrompt());await view.onClose();
 });
 test('manual compression: below threshold, status only and no thinking or summary row',async()=>{
  let release;const {plugin,doc}=ui(async(k,m,s,d,h,o)=>{assert.equal(o.onThinking,undefined);d('short summary');await new Promise(r=>release=r);return{prompt_tokens:1000,completion_tokens:50000};},async()=> '');await plugin.onload();plugin.keys.deepseek='fake';const view=plugin.factory({});await view.onOpen();plugin.session.messages.push({role:'user',content:'long text '.repeat(500)});view.row('user','original');
@@ -1066,8 +1004,8 @@ test('range picker: threshold, two endpoints and exact selected text',async()=>{
 test('range picker: abort dismisses window, full reset and Unicode boundary preserved',async()=>{
  const {plugin,doc,dom}=ui(async()=>{},async()=> '');await plugin.onload();const view=plugin.factory({});await view.onOpen();const c=new AbortController();const p=view.selectTextRange('😀'+'a'.repeat(360000),'unicode',c.signal);const start=doc.querySelector('.sd-range-start');start.value='1';start.dispatchEvent(new dom.window.Event('input'));assert.equal(start.value,'0');[...doc.querySelectorAll('.sd-range-actions button')].find(b=>b.textContent==='全文').click();assert.equal(doc.querySelector('.sd-range-end').value,'360002');c.abort();await assert.rejects(p,{name:'AbortError'});assert.equal(doc.querySelector('.sd-range-picker'),null);await view.onClose();
 });
-test('range picker: attachment only adds selected text to session after confirmation',async()=>{
- const {plugin,doc,dom}=ui(async()=>{},async()=> 'x'.repeat(360000));await plugin.onload();plugin.keys.mineru='fake';const view=plugin.factory({});await view.onOpen();const pending=view.upload({name:'long.pdf',size:10});await new Promise(setImmediate);assert.equal(plugin.session.messages.length,0);const end=doc.querySelector('.sd-range-end');end.value='100';end.dispatchEvent(new dom.window.Event('input'));[...doc.querySelectorAll('.sd-range-actions button')].find(b=>b.textContent==='使用所选范围').click();await pending;assert.equal(plugin.session.entries[0].raw,'x'.repeat(100));assert.ok(plugin.session.messages[0].content.endsWith('x'.repeat(100)));assert.ok(plugin.session.messages[0].content.length<300);await view.onClose();
+test('native PDF attachment sends the file without a local text-range picker',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),()=>assert.fail('no extraction'));await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();view.selectTextRange=()=>assert.fail('native PDF does not use text selection');await view.upload(pdfFile);assert.equal(view.messages.length,0);await view.send();assert.equal(view.messages[0].content[1].type,'file');assert.equal(env.doc.querySelector('.sd-range'),null);await view.onClose();
 });
 
 test('outline: LaTeX hierarchy, starred/short/nested titles and ignored comments/code',()=>{
@@ -1195,41 +1133,40 @@ test('range UI: separate endpoint panes retain titles and independent text previ
 });
 
 const functionCall = (id,name,args) => ({id,type:'function',function:{name,arguments:JSON.stringify(args)}});
-test('web UI: explicit URL references work without a library path, hide body and retain it across deletion',async()=>{
-  const requests=[],sent=[];
-  const env=ui(async(k,m,s,d)=>{sent.push(JSON.parse(JSON.stringify(m)));d('A supported answer.');return {prompt_tokens:100,completion_tokens:5};},async()=>'',{webHttp:async(url,options)=>{requests.push({url,options});return Buffer.from(JSON.stringify({title:'Reference page',content:'# UNIQUE WEB BODY\nUseful detail.'}));}});
+test('web UI: native URL reading needs no library path and retains page signatures across turns and deletion',async()=>{
+  const sent=[];
+  const steps=[{index:0,calls:[{index:0,type:'deepseek_read_url',kind:'read_link',status:'completed',page:{url:'https://example.com/reference',title:'Reference page'},signature:'opaque-page'}]}];
+  const env=ui(async(k,m,s,d,h,o)=>{sent.push(JSON.parse(JSON.stringify(m)));o.onServerToolCalls(steps,{reasoningContent:''});d('A supported answer.');return {prompt_tokens:100,completion_tokens:5};},async()=>'',{saved:{uiLanguage:'zh',webEnabled:true},webHttp:async()=>assert.fail('Native URL reading stays on chat endpoint')});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
   view.input.value='Read @[https://example.com/reference]';await view.send();
-  assert.match(sent[0].at(-1).content,/UNIQUE WEB BODY/);assert.ok(!env.doc.querySelector('.sd-message .sd-body').textContent.includes('UNIQUE WEB BODY'));
-  const sourceBox=env.doc.querySelector('.sd-sources:not([hidden])');assert.equal(sourceBox.open,false);assert.equal(sourceBox.querySelectorAll('a').length,0);assert.match(sourceBox.querySelector('summary').textContent,/1/);sourceBox.open=true;sourceBox.dispatchEvent(new env.dom.window.Event('toggle'));assert.match(sourceBox.textContent,/Reference page/);assert.equal(requests[0].url,'https://api.deepseek.com/v1/tools/fetch');
-  view.input.value='Again @[https://example.com/reference]';await view.send();assert.ok(!sent[1].at(-1).content.includes('UNIQUE WEB BODY'));assert.match(sent[1].at(-1).content,/\[Web reference metadata\]/);const metadata=JSON.parse(sent[1].at(-1).content.split('[Web reference metadata]\n')[1]);assert.equal(metadata.url,'https://example.com/reference');assert.match(metadata.retrieved_at,/^\d{4}-\d{2}-\d{2}T/);
-  assert.match(env.plugin.session.entries[2].contextText,/UNIQUE WEB BODY/);
-  await view.deleteTurn(env.plugin.session.entries[1]);assert.match(env.plugin.session.messages[0].content,/UNIQUE WEB BODY/);await view.onClose();
+  assert.match(sent[0].at(-1).content,/Read https:\/\/example.com\/reference/);assert.ok(!view.feed.textContent.includes('opaque-page'));
+  const sourceBox=env.doc.querySelector('.sd-sources:not([hidden])');assert.equal(sourceBox.open,false);assert.equal(sourceBox.querySelectorAll('a').length,0);assert.match(sourceBox.querySelector('summary').textContent,/1/);sourceBox.open=true;sourceBox.dispatchEvent(new env.dom.window.Event('toggle'));assert.match(sourceBox.textContent,/Reference page/);
+  view.input.value='Again @[https://example.com/reference]';await view.send();assert.equal(sent[1][2].server_tool_calls[0].calls[0].signature,'opaque-page');
+  await view.deleteTurn(env.plugin.session.entries[1]);assert.equal(env.plugin.session.messages.at(-1).server_tool_calls[0].calls[0].signature,'opaque-page');await view.onClose();
 });
 
-test('web UI: autonomous search and fetch preserve full tool history and count each request once',async()=>{
+test('web UI: server search and fetch preserve signed history and count the billed request once',async()=>{
   let step=0;const sent=[];
   const env=ui(async(k,m,s,d,h,o)=>{
     sent.push(JSON.parse(JSON.stringify(m)));o.onThinking('reason '+step);
-    if(step===0)o.onToolCalls([functionCall('search-1','search_web',{query:'reference documentation'})]);
-    else if(step===1)o.onToolCalls([functionCall('fetch-1','fetch_page',{url:'https://example.com/reference'})]);
-    else d('Result with a source.');step++;
-    return {prompt_tokens:100*step,completion_tokens:10,prompt_cache_hit_tokens:50,prompt_cache_miss_tokens:100*step-50};
-  },async()=>'',{webHttp:async(url)=>Buffer.from(JSON.stringify(url.endsWith('/search')?{results:[{url:'https://example.com/reference',title:'Reference',summary:'Relevant summary'}]}:{title:'Reference',content:'Fresh full page text'}))});
+    o.onServerToolCalls([{index:0,reasoning_content:'Search first',calls:[{id:'search-1',sources:[{url:'https://example.com/reference',title:'Reference'}]}]},{index:1,reasoning_content:'Open source',calls:[{id:'fetch-1',page:{url:'https://example.com/reference',title:'Reference'},signature:'opaque'}]}],{reasoningContent:'Final'});
+    d('Result with a source.');step++;
+    return {prompt_tokens:600,completion_tokens:30,prompt_cache_hit_tokens:150,prompt_cache_miss_tokens:450};
+  },async()=>'',{saved:{uiLanguage:'zh',webEnabled:true},webHttp:async()=>assert.fail('Server tools run at DeepSeek')});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='Look up the documentation';await view.send();
-  assert.equal(step,3);assert.equal(sent[1][2].tool_calls[0].id,'search-1');assert.equal(sent[1][2].reasoning_content,'reason 0');assert.equal(sent[1][3].tool_call_id,'search-1');
-  assert.equal(env.plugin.session.cache.measured,3);assert.equal(env.plugin.session.cache.hit,150);assert.equal(env.plugin.session.meter.tokens,310);
-  const journal=env.plugin.session.entries[1].modelMessages;assert.equal(journal.filter(m=>m.role==='tool').length,2);
+  assert.equal(step,1);assert.equal(sent.length,1);
+  assert.equal(env.plugin.session.cache.measured,1);assert.equal(env.plugin.session.cache.hit,150);assert.equal(env.plugin.session.meter.upperBound,true);
+  const journal=env.plugin.session.entries[1].modelMessages;assert.equal(journal[0].server_tool_calls.length,2);assert.equal(journal[0].reasoning_content,'Final');
   await view.onClose();const restored=ui(async()=>{},async()=>'',{saved:env.saved.at(-1),conversationState:env.conversationState});await restored.plugin.onload();assert.deepEqual(restored.plugin.session.messages,JSON.parse(JSON.stringify(env.plugin.session.messages)));
   const reopened=restored.plugin.factory({});await reopened.onOpen();await reopened.deleteTurn(restored.plugin.session.entries[1]);assert.equal(restored.plugin.session.messages.length,0);await reopened.onClose();
 });
 
-test('web UI: preflight compression reattaches previously deduplicated original and reuses one fetch',async()=>{
-  let fetches=0,generations=0;const sent=[];
-  const env=ui(async(k,m,s,d,h,o)=>{if(o.tools){sent.push(JSON.parse(JSON.stringify(m)));d('answer');generations++;return {prompt_tokens:100,completion_tokens:2};}d('compact checkpoint');return {prompt_tokens:800000,completion_tokens:5};},async()=>'',{webHttp:async()=>{fetches++;return Buffer.from(JSON.stringify({title:'Page',content:'ORIGINAL WEB DETAILS '.repeat(20)}));}});
+test('web UI: native URL reading remains available after preflight compression',async()=>{
+  let generations=0;const sent=[];
+  const env=ui(async(k,m,s,d,h,o)=>{if(o.tools){sent.push(JSON.parse(JSON.stringify(m)));d('answer');generations++;return {prompt_tokens:100,completion_tokens:2};}d('compact checkpoint');return {prompt_tokens:800000,completion_tokens:5};},async()=>'',{saved:{uiLanguage:'zh',webEnabled:true},webHttp:async()=>assert.fail('Native URL reading stays on chat endpoint')});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='@[https://example.com/ref] first';await view.send();
-  env.plugin.session.meter={tokens:800000,count:env.plugin.session.messages.length,model:env.plugin.model,systemPrompt:ctx.SYSTEM_PROMPT};
-  view.input.value='@[https://example.com/ref] second';await view.send();assert.equal(generations,2);assert.equal(fetches,2);assert.match(sent[1].at(-1).content,/ORIGINAL WEB DETAILS/);assert.equal(env.plugin.session.compactions,1);await view.onClose();
+  env.plugin.session.meter={tokens:800000,count:env.plugin.session.messages.length,model:env.plugin.model,systemPrompt:view.requestPrompt()};
+  view.input.value='@[https://example.com/ref] second';await view.send();assert.equal(generations,2);assert.match(sent[1].at(-1).content,/https:\/\/example.com\/ref second/);assert.equal(env.plugin.session.compactions,1);await view.onClose();
 });
 
 test('Notebook staged batches require confirmation, send a compact receipt and do not echo applied code next turn',async()=>{
@@ -1256,10 +1193,11 @@ test('old Notebook apply actions are disabled during a tool-enabled reply',async
   const button=env.doc.querySelector('.sd-notebook-apply');view.input.value='New question';const pending=view.send();await new Promise(setImmediate);assert.equal(button.disabled,true);button.click();assert.equal(applied,0);release();await pending;assert.equal(button.disabled,false);await view.onClose();
 });
 
-test('clearing while web fetch is pending cannot populate the new conversation or issue a generation',async()=>{
-  let resolveFetch,generations=0;const env=ui(async()=>{generations++;},async()=>'',{webHttp:()=>new Promise(resolve=>resolveFetch=resolve)});await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
-  view.input.value='@[https://example.com/reference]';const pending=view.send();await new Promise(setImmediate);const clearing=view.clear();await new Promise(setImmediate);env.doc.querySelector('.sd-confirm .mod-cta')?.click();await clearing;resolveFetch(Buffer.from('{"title":"Late","content":"late body"}'));await pending;
-  assert.equal(generations,0);assert.equal(env.plugin.session.messages.length,0);assert.equal(env.plugin.session.entries.length,0);assert.equal(env.plugin.session.meter,null);await view.onClose();
+test('clearing while server web reading is pending ignores late text and sources',async()=>{
+  let late,generations=0;
+  const env=ui(async(k,m,s,d,h,o)=>{generations++;late=()=>{d('late body');o.onServerToolEvent({type:'call_completed',step:0,call:{page:{url:'https://example.com',title:'Late'}}});};await new Promise(resolve=>s.addEventListener('abort',resolve,{once:true}));},async()=>'',{saved:{uiLanguage:'zh',webEnabled:true},webHttp:async()=>assert.fail('Server web uses the chat endpoint')});await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();
+  view.input.value='@[https://example.com/reference]';const pending=view.send();await new Promise(setImmediate);const clearing=view.clear();await new Promise(setImmediate);env.doc.querySelector('.sd-confirm .mod-cta')?.click();await clearing;late();await pending;
+  assert.equal(generations,1);assert.equal(env.plugin.session.messages.length,0);assert.equal(env.plugin.session.entries.length,0);assert.equal(env.plugin.session.meter,null);await view.onClose();
 });
 
 test('reopening an interrupted tool request appends paired unknown results and keeps them after rebuilding',async()=>{
@@ -1290,7 +1228,7 @@ test('confirmed Notebook application locks conversation actions until the verifi
 });
 
 test('source labels escape webpage markup instead of allowing it to load an image',async()=>{
-  const env=ui(async(k,m,s,d)=>d('Answer.'),async()=>'',{webHttp:async()=>Buffer.from(JSON.stringify({title:'<img src="https://example.com/image">\n`unsafe`',content:'Text source'}))});await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='@[https://example.com/ref]';await view.send();
+  const env=ui(async(k,m,s,d,h,o)=>{o.onServerToolEvent({type:'call_completed',step:0,call:{page:{url:'https://example.com/ref',title:'<img src="https://example.com/image">\n`unsafe`'}}});d('Answer.');},async()=>'',{saved:{uiLanguage:'zh',webEnabled:true},webHttp:async()=>assert.fail('Server web uses the chat endpoint')});await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='@[https://example.com/ref]';await view.send();
   const sourceBox=env.doc.querySelector('.sd-sources:not([hidden])');assert.equal(sourceBox.open,false);sourceBox.open=true;sourceBox.dispatchEvent(new env.dom.window.Event('toggle'));assert.match(sourceBox.querySelector('a').textContent,/<img/);assert.match(sourceBox.querySelector('a').textContent,/`unsafe`/);assert.equal(env.doc.querySelectorAll('.sd-sources-body img').length,0);assert.ok(!env.renders.some(render=>render.text.includes('unsafe')));await view.onClose();
 });
 
@@ -1315,9 +1253,9 @@ test('disabled Search Fetch treats public and private explicit URLs as plain tex
 });
 
 test('a web toggle change during generation applies to the next message, not the active tool turn',async()=>{
-  let release;const modes=[];const env=ui(async(k,m,s,d,h,o)=>{modes.push(o.tools.map(tool=>tool.function.name));if(modes.length===1)await new Promise(resolve=>release=resolve);d('Answer');return{prompt_tokens:10,completion_tokens:2};},async()=> '');
+  let release;const modes=[];const env=ui(async(k,m,s,d,h,o)=>{modes.push(o.tools.map(tool=>tool.function?.name || tool.type));if(modes.length===1)await new Promise(resolve=>release=resolve);d('Answer');return{prompt_tokens:10,completion_tokens:2};},async()=> '',{saved:{uiLanguage:'zh',webEnabled:true}});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='First';const pending=view.send();await new Promise(setImmediate);view.searchFetchToggle.checked=false;view.searchFetchToggle.dispatchEvent(new env.dom.window.Event('change'));release();await pending;
-  assert.ok(modes[0].includes('search_web'));view.input.value='Second';await view.send();assert.deepEqual(modes[1],[]);await view.onClose();
+  assert.ok(modes[0].includes('deepseek_web_search'));view.input.value='Second';await view.send();assert.deepEqual(modes[1],[]);await view.onClose();
 });
 
 test('reported weather pseudo-call is visibly unexecuted while raw text, thinking and exact usage survive reopening',async()=>{
@@ -1345,13 +1283,13 @@ test('ordinary chat recovers an unavailable Notebook call and preserves its clos
   const final='Here is code:\n\n```python\nprint(1 + 1)\n```';
   const http=async(_url,options)=>{
     const request=JSON.parse(options.body),first=requests++===0;
-    assert.deepEqual(request.tools.map(tool=>tool.function.name),['search_web','fetch_page']);
+    assert.deepEqual(request.tools.map(tool=>tool.function?.name || tool.type),['deepseek_web_search','deepseek_read_url']);
     assert.equal(JSON.stringify(request.messages.slice(1,5)),JSON.stringify(oldMessages));
     if(first) options.onChunk(Buffer.from('data: '+JSON.stringify({choices:[{delta:{reasoning_content:'Inspect the earlier notebook.',tool_calls:[{index:0,...pendingCall}]},finish_reason:'tool_calls'}],usage:{prompt_tokens:100,completion_tokens:10,prompt_cache_hit_tokens:60,prompt_cache_miss_tokens:40}})+'\n\n'));
     else {
       assert.deepEqual(request.messages.find(message=>message.tool_calls?.some(call=>call.id===pendingCall.id)).tool_calls,[pendingCall]);
       const result=JSON.parse(request.messages.find(message=>message.tool_call_id===pendingCall.id).content);
-      assert.equal(result.executed,false);assert.deepEqual(result.availableTools,['search_web','fetch_page']);
+      assert.equal(result.executed,false);assert.deepEqual(result.availableTools,['deepseek_web_search','deepseek_read_url']);
       options.onChunk(Buffer.from('data: '+JSON.stringify({choices:[{delta:{content:final},finish_reason:'stop'}],usage:{prompt_tokens:200,completion_tokens:20,prompt_cache_hit_tokens:150,prompt_cache_miss_tokens:50}})+'\n\n'));
     }
     options.onChunk(Buffer.from('data: [DONE]\n\n'));
@@ -1384,17 +1322,16 @@ test('unavailable tool recovery and terminal messages support both interface lan
   }
 });
 
-test('reported DSML leak is recovered through a native call, hidden on screen and preserved verbatim after reopening',async()=>{
+test('reported DSML leak is recovered through a server web call and preserved verbatim after reopening',async()=>{
   let step=0,webCalls=0;const final='The source is a dated snapshot; current conditions could not be verified.';
   const env=ui(async(k,m,s,d,h,o)=>{
     if(step===0){for(const character of reportedDsml)d(character);}
-    else if(step===1){assert.equal(m[2].content,reportedDsml);assert.match(m[3].content,/not executed/);o.onToolCalls([functionCall('native-recovery','search_web',{query:'Washington DC weather',count:1,need_content:true})]);}
-    else {const result=JSON.parse(m.at(-1).content);assert.equal(result.results[0].date,'2026-03-28T07:53:55-04:00');assert.equal(result.results[0].text_kind,'content');assert.match(result.retrieved_at,/^\d{4}-/);d(final);}
+    else {assert.equal(m[2].content,reportedDsml);assert.match(m[3].content,/not executed/);o.onServerToolEvent({type:'call_completed',step:0,call:{sources:[{url:'https://example.com/forecast',title:'Dated forecast'}]}});d(final);}
     step++;return {prompt_tokens:100*step,completion_tokens:10,prompt_cache_hit_tokens:10,prompt_cache_miss_tokens:100*step-10};
   },async()=>'',{saved:{uiLanguage:'en',webEnabled:true},webHttp:async()=>{webCalls++;return Buffer.from(JSON.stringify({results:[{url:'https://example.com/forecast',title:'Dated forecast',content:'Published 2026-03-28. Old observations.',date:'2026-03-28T07:53:55-04:00'}]}));}});
   await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='what about dc';await view.send();
-  assert.equal(step,3);assert.equal(webCalls,1);const entry=env.plugin.session.entries[1];assert.equal(entry.raw,reportedDsml+final);assert.equal(entry.displayText,final);assert.equal(entry.modelMessages[0].content,reportedDsml);assert.equal(entry.toolProtocolError,undefined);assert.equal(env.plugin.session.cache.measured,3);assert.equal(entry.usage.prompt_tokens,600);
-  const body=env.doc.querySelectorAll('.sd-body')[1].textContent;assert.match(body,/current conditions could not be verified/);assert.ok(!body.includes('DSML'));assert.match(env.doc.querySelector('.sd-sources:not([hidden]) summary').textContent,/Retrieved pages/);assert.equal(env.doc.querySelector('.sd-sources:not([hidden])').open,false);assert.ok(entry.protocolRecovery.some(event=>event.recovered));assert.ok(entry.requestCapabilities.tools.includes('search_web'));
+  assert.equal(step,2);assert.equal(webCalls,0);const entry=env.plugin.session.entries[1];assert.equal(entry.raw,reportedDsml+final);assert.equal(entry.displayText,final);assert.equal(entry.modelMessages[0].content,reportedDsml);assert.equal(entry.toolProtocolError,undefined);assert.equal(env.plugin.session.cache.measured,2);assert.equal(entry.usage.prompt_tokens,300);
+  const body=env.doc.querySelectorAll('.sd-body')[1].textContent;assert.match(body,/current conditions could not be verified/);assert.ok(!body.includes('DSML'));assert.match(env.doc.querySelector('.sd-sources:not([hidden]) summary').textContent,/Retrieved pages/);assert.equal(env.doc.querySelector('.sd-sources:not([hidden])').open,false);assert.ok(entry.protocolRecovery.some(event=>event.recovered));assert.ok(entry.requestCapabilities.tools.includes('deepseek_web_search'));
   await view.onClose();const next=ui(async()=>{},async()=>'',{saved:env.saved.at(-1),conversationState:env.conversationState});await next.plugin.onload();const reopened=next.plugin.factory({});await reopened.onOpen();assert.equal(next.plugin.session.entries[1].raw,reportedDsml+final);assert.equal(next.plugin.session.entries[1].displayText,final);assert.ok(!next.doc.querySelectorAll('.sd-body')[1].textContent.includes('DSML'));await reopened.onClose();
 });
 
@@ -1418,22 +1355,13 @@ test('cancelling before a leaked protocol response finishes keeps raw data but n
 
 function attachedImage(name='figure.png',suffix=0){const bytes=Buffer.from([137,80,78,71,13,10,26,10,suffix]);return{name,size:bytes.length,arrayBuffer:async()=>bytes};}
 
-test('images stage without a key, deduplicate by content, support removal and image-only Send',async()=>{
-  let visions=0,generations=0;
-  const env=ui(async(k,m,s,d)=>{generations++;d('Overview');},async()=>'',{visionSend:async(k,m,s,d)=>{visions++;assert.match(m[0].content[0].text,/Describe the attached images/);d('A labelled diagram.');}});
-  await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();view.input.value='Keep draft';
-  await view.uploadFiles([attachedImage('first.png'),attachedImage('renamed.png')]);assert.equal(view.pendingImages.length,1);assert.equal(view.images.metadata().length,1);assert.equal(view.session.messages.length,0);assert.equal(visions,0);assert.equal(view.input.value,'Keep draft');
-  const removed=view.pendingImages[0].id;view.pendingImageList.querySelector('button').click();assert.equal(view.pendingImages.length,0);assert.equal(view.images.get(removed),undefined);assert.equal(view.input.value,'Keep draft');
-  await view.upload(attachedImage('image-only.png'));env.plugin.keys.deepseek='fake';view.input.value='';await view.send();assert.equal(visions,1);assert.equal(generations,1);assert.equal(view.pendingImages.length,0);assert.equal(view.session.entries[0].raw,'image-only.png');assert.equal(view.session.entries[0].images.length,1);await view.onClose();
+test('attachments stage without a key, support removal, and image-only Send deduplicates bytes',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Overview'),async()=> '');await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();view.input.value='Keep draft';await view.uploadFiles([attachedImage('first.png'),attachedImage('renamed.png')]);assert.equal(env.fileUploads.length,0);assert.equal(view.messages.length,0);view.pendingImageList.querySelector('button').click();assert.equal(view.pendingFiles.length,1);assert.equal(view.input.value,'Keep draft');env.plugin.keys.deepseek='key';view.input.value='';await view.send();assert.equal(env.fileUploads.length,1);assert.equal(view.session.entries[0].raw,'renamed.png');assert.equal(view.pendingFiles.length,0);await view.onClose();
 });
 
-test('multiple images share the current question in one vision request independently of Search Fetch',async()=>{
-  const requests=[];let seen;
-  const env=ui(async(k,m,s,d,h,o)=>{seen=JSON.parse(JSON.stringify(m));assert.deepEqual(o.tools.map(tool=>tool.function.name),['read_image']);d('The second curve is steeper.');},async()=>'',{saved:{uiLanguage:'en',webEnabled:false},visionSend:async(k,m,s,d)=>{requests.push(m);d('Image 1 rises slowly; Image 2 rises quickly.');}});
-  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.uploadFiles([attachedImage('before.png',1),attachedImage('after.png',2)]);view.input.value='Compare the slopes';await view.send();
-  assert.equal(requests.length,1);const content=requests[0][0].content;assert.match(content[0].text,/Compare the slopes/);assert.match(content[0].text,/before\.png/);assert.match(content[0].text,/after\.png/);assert.equal(content.filter(part=>part.type==='image_url').length,2);assert.ok(content.filter(part=>part.type==='image_url').every(part=>part.image_url.detail==='original'));
-  assert.ok(seen.every(message=>typeof message.content==='string'));assert.ok(JSON.stringify(seen).includes('Image 2 rises quickly'));assert.ok(!JSON.stringify(seen).includes('base64,'));assert.ok(!view.feed.textContent.includes('Image 1 rises slowly'));
-  await env.plugin.saveQueue;const archive=JSON.stringify([...env.conversationState.values()]);assert.ok(!archive.includes('base64,'));assert.ok(!archive.includes('"type":"Buffer"'));assert.equal(view.session.entries[0].images.length,2);await view.onClose();
+test('multiple images join the current question in one native chat independently of Search Fetch',async()=>{
+ let seen;const env=ui(async(k,m,s,d,h,o)=>{seen=structuredClone(m);assert.equal(o.tools.length,0);d('The second curve is steeper.');},async()=>'',{saved:{uiLanguage:'en',webEnabled:false}});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.uploadFiles([attachedImage('before.png',1),attachedImage('after.png',2)]);view.input.value='Compare the slopes';await view.send();
+ const content=seen.at(-1).content;assert.match(content[0].text,/Compare the slopes/);assert.equal(content.filter(part=>part.type==='file').length,2);assert.equal(env.fileUploads.length,2);await env.plugin.saveQueue;const archive=JSON.stringify([...env.conversationState.values()]);assert.ok(!archive.includes('base64,'));assert.ok(!archive.includes('"type":"Buffer"'));assert.equal(view.session.entries[0].files.length,2);await view.onClose();
 });
 
 test('read_image returns text-only crop results and counts auxiliary vision usage without replacing the chat meter',async()=>{
@@ -1442,45 +1370,29 @@ test('read_image returns text-only crop results and counts auxiliary vision usag
     if(steps++===0){o.onToolCalls([functionCall('inspect-region','read_image',{imageIds:[view.session.entries[0].images[0].id],question:'Read the small axis label',region:{x:0.5,y:0.5,width:0.5,height:0.5}})]);return{prompt_tokens:100,completion_tokens:5,prompt_cache_hit_tokens:80,prompt_cache_miss_tokens:20};}
     const result=JSON.parse(m.at(-1).content);assert.equal(result.description,'The small axis label is seconds.');assert.deepEqual(result.region,{x:0.5,y:0.5,width:0.5,height:0.5});assert.ok(!JSON.stringify(result).includes('base64,'));d('The axis shows seconds.');return{prompt_tokens:200,completion_tokens:7,prompt_cache_hit_tokens:150,prompt_cache_miss_tokens:50};
   },async()=>'',{saved:{webEnabled:false},visionSend:async(k,m,s,d)=>{d(visions?'The small axis label is seconds.':'A plot with a small axis label.');return visionUsage[visions++];},imageStoreOptions:{cropImage:async(image,region)=>{cropCalls++;return{...image,region,width:320,height:240};}}});
-  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read this plot';await view.send();
+  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();const retained=await view.images.add(attachedImage(),signal());view.pendingImages=[retained];view.input.value='Read this plot';await view.send();
   assert.equal(visions,2,view.status.textContent+' '+JSON.stringify(view.session.entries.at(-1)));assert.equal(cropCalls,1);assert.equal(view.session.cache.measured,4);assert.equal(view.session.cache.hit,275);assert.equal(view.session.cache.miss,135);assert.equal(view.session.meter.tokens,207);assert.match(view.session.entries[1].usageText,/410/);assert.match(view.session.entries[1].usageText,/33/);assert.equal(view.session.entries[1].modelMessages.filter(message=>message.role==='tool').length,1);await view.onClose();
 });
 
-test('failed vision retains pending attachments and draft for retry and exact repeats reuse recognition',async()=>{
-  let attempts=0,generations=0;
-  const env=ui(async(k,m,s,d)=>{generations++;d('Answer');},async()=>'',{visionSend:async(k,m,s,d)=>{if(++attempts===1)throw Error('temporary vision failure');d('Reusable image evidence');return{prompt_tokens:30,completion_tokens:4,prompt_cache_hit_tokens:0,prompt_cache_miss_tokens:30};}});
-  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read the labels';await view.send();assert.equal(attempts,1);assert.equal(generations,0);assert.equal(view.pendingImages.length,1);assert.equal(view.input.value,'Read the labels');assert.equal(view.session.entries.length,0);
-  await view.send();assert.equal(attempts,2);assert.equal(generations,1);await view.upload(attachedImage('renamed.png'));view.input.value='Read the labels';await view.send();assert.equal(attempts,2);assert.equal(generations,2);assert.equal(view.session.entries[2].imageAnalysis.cached,true);assert.equal(view.session.cache.measured,1);await view.onClose();
+test('failed file upload retains draft and attachments, retry and exact repeats reuse the upload',async()=>{
+ let attempts=0,calls=0;const env=ui(async(k,m,s,d)=>{calls++;d('Answer');},async()=>'',{deepseekFiles:{uploadFile:async file=>{if(++attempts===1)throw Error('temporary upload failure');return{id:'file-api-retry',name:file.name,purpose:'user_data',expiresAt:Date.now()/1000+10000};}}});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read labels';await view.send();assert.equal(attempts,1);assert.equal(calls,0);assert.equal(view.pendingFiles.length,1);assert.equal(view.input.value,'Read labels');assert.equal(view.session.entries.length,0);
+ await view.send();assert.equal(attempts,2);assert.equal(calls,1);await view.upload(attachedImage('renamed.png'));view.input.value='Read labels';await view.send();assert.equal(attempts,2);assert.equal(calls,2);await view.onClose();
 });
 
-test('Stop Clear and Close cancel the entire attachment batch during reading or decoding',async()=>{
-  for(const phase of ['reading','decoding'])for(const action of ['stop','clear','close']){
-    let release,secondReads=0,visions=0;
-    const env=ui(async()=>assert.fail('no generation while staging'),async()=>'',{visionSend:async()=>{visions++;},...(phase==='decoding'?{imageStoreOptions:{decodeDimensions:()=>new Promise(resolve=>release=()=>resolve({width:640,height:480}))}}:{})});
-    await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();const first=attachedImage('first.png',1),second=attachedImage('second.png',2);if(phase==='reading')first.arrayBuffer=()=>new Promise(resolve=>release=()=>resolve(Buffer.from([137,80,78,71,13,10,26,10,1])));second.arrayBuffer=async()=>{secondReads++;return Buffer.from([137,80,78,71,13,10,26,10,2]);};
-    const pending=view.uploadFiles([first,second]);await new Promise(setImmediate);assert.equal(typeof release,'function');if(action==='stop')view.sendButton.click();else if(action==='clear')await view.clear();else await view.onClose();release();await pending;
-    assert.equal(secondReads,0,phase+' '+action);assert.equal(visions,0);assert.equal(view.pendingImages.length,0);assert.equal(view.images.metadata().length,0);assert.equal(view.session.messages.length,0);assert.equal(view.session.entries.length,0);if(!view.closed)await view.onClose();
-  }
+test('attachment staging reads no binary data and Clear or Close releases the pending batch',async()=>{
+ for(const action of ['clear','close']){const env=ui(async()=>assert.fail('no generation while staging'),async()=> '');await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();const file={...attachedImage(),arrayBuffer:()=>assert.fail('no read before Send')};await view.uploadFiles([file,{...file,name:'second.png'}]);assert.equal(view.pendingFiles.length,2);if(action==='clear')await view.clear();else await view.onClose();assert.equal(view.pendingFiles.length,0);assert.equal(view.messages.length,0);if(!view.closed)await view.onClose();}
 });
 
-test('Stop Clear and Close ignore late vision completion and never create a partial user turn',async()=>{
-  for(const action of ['stop','clear','close']){
-    let release,generations=0;
-    const env=ui(async()=>{generations++;},async()=>'',{visionSend:async(k,m,s,d)=>{await new Promise(resolve=>release=resolve);d('Late image description');return{prompt_tokens:10,completion_tokens:2,prompt_cache_hit_tokens:0,prompt_cache_miss_tokens:10};}});
-    await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Inspect';const pending=view.send();await new Promise(setImmediate);assert.equal(typeof release,'function');if(action==='stop')view.sendButton.click();else if(action==='clear')await view.clear();else await view.onClose();await pending;release();await new Promise(setImmediate);
-    assert.equal(generations,0);assert.equal(view.session.messages.length,0);assert.equal(view.session.entries.length,0);assert.equal(view.pendingImages.length,action==='stop'?1:0);if(!view.closed)await view.onClose();
-  }
+test('Stop Clear and Close ignore late file upload and never create a partial user turn',async()=>{
+ for(const action of ['stop','clear','close']){let release,calls=0;const env=ui(async()=>{calls++;},async()=>'',{deepseekFiles:{uploadFile:async file=>{await new Promise(resolve=>release=resolve);return{id:'file-api-late',name:file.name,expiresAt:Date.now()/1000+10000};}}});await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Inspect';const pending=view.send();await new Promise(setImmediate);assert.equal(typeof release,'function');if(action==='stop')view.sendButton.click();else if(action==='clear')await view.clear();else await view.onClose();release();await pending;assert.equal(calls,0);assert.equal(view.messages.length,0);assert.equal(view.session.entries.length,0);assert.equal(view.pendingFiles.length,action==='stop'?1:0);if(!view.closed)await view.onClose();}
 });
 
-test('switching conversations releases originals while saved image references return an honest unavailable result',async()=>{
-  let steps=0,visions=0;
-  const env=ui(async(k,m,s,d,h,o)=>{if(steps++===1){o.onToolCalls([functionCall('reread-missing','read_image',{imageIds:[view.session.entries[0].images[0].id],question:'Read more detail'})]);return;}if(steps===3){assert.match(m.at(-1).content,/重新上传|reattach|released/);d('Please attach the image again.');}else d('First answer');},async()=>'',{saved:{webEnabled:false},visionSend:async(k,m,s,d)=>{visions++;d('Saved text evidence');}});
-  await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Inspect';await view.send();const id=env.plugin.activeConversationId,imageId=view.session.entries[0].images[0].id;await view.newConversation();assert.equal(view.images.get(imageId),undefined);await view.switchConversation(id);assert.equal(view.session.entries[0].images[0].id,imageId);assert.match(view.messages[0].content,/Saved text evidence/);view.input.value='Look again';await view.send();assert.equal(visions,1);assert.match(view.session.entries.at(-1).raw,/attach the image again/);await view.onClose();
+test('switching conversations retains cloud file IDs and excludes local bytes',async()=>{
+ let seen;const env=ui(async(k,m,s,d)=>{seen=structuredClone(m);d('Answer');},async()=> '');await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Inspect';await view.send();const conversationId=env.plugin.activeConversationId,fileId=view.session.entries[0].files[0].id;await view.newConversation();assert.equal(view.pendingFiles.length,0);await view.switchConversation(conversationId);view.input.value='Look again';await view.send();assert.equal(seen[1].content[1].file_id,fileId);assert.equal(env.fileUploads.length,1);assert.ok(!JSON.stringify(view.session).includes('base64,'));await view.onClose();
 });
 
-test('deleting an image turn restores available attachments and the original question for an unchanged retry',async()=>{
-  let visions=0;
-  const env=ui(async(k,m,s,d)=>d('Answer'),async()=>'',{visionSend:async(k,m,s,d)=>{visions++;d('Same original evidence');}});await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read these labels';await view.send();const entry=view.session.entries[1],imageId=view.session.entries[0].images[0].id;await view.deleteTurn(entry);assert.equal(view.input.value,'Read these labels');assert.equal(view.pendingImages.length,1);assert.equal(view.pendingImages[0].id,imageId);assert.equal(view.session.messages.length,0);await view.send();assert.equal(visions,1);assert.match(view.session.messages[0].content,/Same original evidence/);await view.onClose();
+test('deleting a file turn restores the question and reusable attachment for retry',async()=>{
+ const env=ui(async(k,m,s,d)=>d('Answer'),async()=> '');await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Read labels';await view.send();const fileId=view.session.entries[0].files[0].id;await view.deleteTurn(view.session.entries[1]);assert.equal(view.input.value,'Read labels');assert.equal(view.pendingFiles.length,1);assert.equal(view.pendingFiles[0].remote.id,fileId);assert.equal(view.messages.length,0);await view.send();assert.equal(env.fileUploads.length,1);assert.equal(view.messages[0].content[1].file_id,fileId);await view.onClose();
 });
 
 function notebookUiFixture(){return{nbformat:4,nbformat_minor:5,metadata:{},cells:[{id:'calc',cell_type:'code',metadata:{},source:'rate = 0.1\nlabel = "old"\nprint(rate)',outputs:[],execution_count:null},{id:'notes',cell_type:'markdown',metadata:{},source:'Original note'}]};}
@@ -1656,11 +1568,11 @@ test('offscreen expanded thinking and retrieved pages release DOM and restore it
   onVisibility([{target:state.element,isIntersecting:true}]);assert.equal(state.thinkingBody.textContent,entry.thinking);assert.equal(sourceBody.querySelectorAll('a').length,1);assert.equal(state.thinkingBody.style.minHeight,'');assert.equal(sourceBody.style.minHeight,'');await new Promise(setImmediate);view.disposeRows();assert.equal(state.thinkingBody.childNodes.length,0);assert.equal(sourceBody.childNodes.length,0);state.thinkingBox.dispatchEvent(new env.dom.window.Event('toggle'));sourceBox.dispatchEvent(new env.dom.window.Event('toggle'));state.thinkingView.setVisible(true);state.sourceList.setVisible(true);assert.equal(state.thinkingBody.childNodes.length,0);assert.equal(sourceBody.childNodes.length,0);assert.equal(entry.thinking,'First thought.\n\nSecond thought.');await view.onClose();
 });
 
-test('stopping after a web tool refreshes collapsed sources without revealing queued text or hidden protocol markup',async()=>{
+test('stopping after a web tool refreshes collapsed sources and preserves the visible reply without hidden protocol markup',async()=>{
   for(const withAnswer of [false,true]){
     let calls=0,waiting=false,releaseRender;const answer='Safe answer with evidence. '.repeat(60);
-    const env=ui(async(k,m,s,d,h,o)=>{if(calls++===0){d(reportedDsml);return{prompt_tokens:100,completion_tokens:5};}if(calls===2){o.onToolCalls([functionCall('search-before-stop','search_web',{query:'reference'})]);return{prompt_tokens:150,completion_tokens:5};}if(withAnswer)d(answer);waiting=true;await new Promise((resolve,reject)=>s.addEventListener('abort',()=>reject(Object.assign(Error('stopped'),{name:'AbortError'})),{once:true}));},async()=>'',{saved:{uiLanguage:'en'},pacingRate:20,render:async text=>{if(withAnswer&&text&&answer.startsWith(text))await new Promise(resolve=>releaseRender=resolve);},webHttp:async()=>Buffer.from(JSON.stringify({results:[{url:'https://example.com/ref',title:'Reference page',content:'Verified reference text'}]}))});
-    await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='Search for evidence';const pending=view.send();await uiEventually(()=>waiting);if(withAnswer)await new Promise(resolve=>setTimeout(resolve,100));const state=[...view.rows].at(-1);let rendering;if(withAnswer){rendering=view.render(state);await uiEventually(()=>releaseRender);}const shown=state.body.textContent,history=JSON.stringify(view.messages);assert.ok(shown.length<answer.length);view.sendButton.click();await pending;if(releaseRender){releaseRender();await rendering;}assert.equal(state.streaming,false);assert.equal(state.timer,null);assert.equal(state.body.textContent,shown);assert.ok(!state.body.textContent.includes('DSML'));assert.equal(state.entry.raw,reportedDsml+(withAnswer?answer:''));assert.equal(state.entry.displayText,withAnswer?answer:'');assert.equal(JSON.stringify(view.messages),history);
+    const env=ui(async(k,m,s,d,h,o)=>{if(calls++===0){d(reportedDsml);return{prompt_tokens:100,completion_tokens:5};}o.onServerToolEvent({type:'call_completed',step:0,call:{sources:[{url:'https://example.com/ref',title:'Reference page'}]}});if(withAnswer)d(answer);waiting=true;await new Promise((resolve,reject)=>s.addEventListener('abort',()=>reject(Object.assign(Error('stopped'),{name:'AbortError'})),{once:true}));},async()=>'',{saved:{uiLanguage:'en',webEnabled:true},render:async text=>{if(withAnswer&&text&&answer.startsWith(text))await new Promise(resolve=>releaseRender=resolve);},webHttp:async()=>Buffer.from(JSON.stringify({results:[{url:'https://example.com/ref',title:'Reference page',content:'Verified reference text'}]}))});
+    await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();view.input.value='Search for evidence';const pending=view.send();await uiEventually(()=>waiting);if(withAnswer)await new Promise(resolve=>setTimeout(resolve,100));const state=[...view.rows].at(-1);let rendering;if(withAnswer){rendering=view.render(state);await uiEventually(()=>releaseRender);}const shown=state.body.textContent,history=JSON.stringify(view.messages);assert.ok(shown.length<=answer.length);view.sendButton.click();await pending;if(releaseRender){releaseRender();await rendering;}assert.equal(state.streaming,false);assert.equal(state.timer,null);assert.equal(state.body.textContent,shown);assert.ok(!state.body.textContent.includes('DSML'));assert.equal(state.entry.raw,reportedDsml+(withAnswer?answer:''));assert.equal(state.entry.displayText,withAnswer?answer:'');assert.equal(JSON.stringify(view.messages),history);
     assert.equal(state.sourcesBox.hidden,false);assert.equal(state.sourcesBox.open,false);assert.equal(state.sourcesBox.querySelector('summary').textContent,'Retrieved pages (1)');assert.equal(state.sourcesBox.querySelectorAll('a').length,0);state.sourcesBox.open=true;state.sourcesBox.dispatchEvent(new env.dom.window.Event('toggle'));assert.equal(state.sourcesBox.querySelector('a').href,'https://example.com/ref');assert.equal(state.sourcesBox.querySelector('a').textContent,'Reference page');await view.onClose();assert.equal(env.conversationState.get(env.plugin.activeConversationId).session.entries[1].sources[0].url,'https://example.com/ref');
   }
 });
@@ -1735,9 +1647,9 @@ test('explicit bottom navigation requests instant scrolling even when a theme re
 async function pausedDraftPreflight(kind){
   let release,fail,generations=0;const requests=[],usage={prompt_tokens:100,completion_tokens:5},options={saved:{uiLanguage:'en'}};
   if(kind==='web')options.webHttp=()=>new Promise((resolve,reject)=>{release=()=>resolve(Buffer.from(JSON.stringify({title:'Reference',content:'Reference text'})));fail=()=>reject(Error('preflight failed'));});
-  if(kind==='vision')options.visionSend=async(k,m,s,d)=>new Promise((resolve,reject)=>{release=()=>{d('The figure has a rising curve.');resolve(usage);};fail=()=>reject(Error('preflight failed'));});
+  if(kind==='vision'||kind==='web')options.deepseekFiles={uploadFile:file=>new Promise((resolve,reject)=>{release=()=>resolve({id:'file-api-preflight',name:file.name,expiresAt:Date.now()/1000+10000});fail=()=>reject(Error('preflight failed'));})};
   if(kind==='models')options.listModels=()=>new Promise((resolve,reject)=>{release=()=>resolve({data:[{id:'deepseek-flash',context_window:1048576,max_output_tokens:393216,input_modalities:['text','image']}]});fail=()=>reject(Error('preflight failed'));});
-  const env=ui(async(k,m,s,d)=>{generations++;requests.push(structuredClone(m));d('Answer');return usage;},async()=>'',options);await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();if(kind==='vision')await view.upload(attachedImage());view.input.value='  Original question'+(kind==='web'?' @[https://example.com/ref]':'')+'\n ';const submitted=view.input.value,pending=view.send();await uiEventually(()=>release);return{env,view,pending,submitted,requests,get generations(){return generations;},release:()=>release(),fail:()=>fail()};
+  const env=ui(async(k,m,s,d)=>{generations++;requests.push(structuredClone(m));d('Answer');return usage;},async()=>'',options);await env.plugin.onload();env.plugin.keys.deepseek='fake';const view=env.plugin.factory({});await view.onOpen();if(kind==='vision'||kind==='web')await view.upload(attachedImage());view.input.value='  Original question'+(kind==='web'?' @[https://example.com/ref]':'')+'\n ';const submitted=view.input.value,pending=view.send();await uiEventually(()=>release);return{env,view,pending,submitted,requests,get generations(){return generations;},release:()=>release(),fail:()=>fail()};
 }
 
 test('successful web vision and model preflight preserve a newer draft and its selection without sending it',async()=>{
@@ -1752,7 +1664,7 @@ test('successful preflight clears only the unchanged original draft including it
 
 test('stopped or failed web and vision preflight keep the newer draft instead of restoring the submitted text',async()=>{
   for(const kind of ['web','vision'])for(const action of ['stop','failure']){
-    const testCase=await pausedDraftPreflight(kind),{view}=testCase,newDraft='NEW_DRAFT_AFTER_SEND\nkeep this';view.input.value=newDraft;view.input.setSelectionRange(2,9);if(action==='stop'){view.sendButton.click();testCase.release();}else testCase.fail();await testCase.pending;assert.equal(testCase.generations,0,kind+' '+action);assert.equal(view.input.value,newDraft);assert.equal(view.input.selectionStart,2);assert.equal(view.input.selectionEnd,9);assert.equal(view.session.entries.length,0);assert.equal(view.messages.length,0);if(kind==='vision')assert.equal(view.pendingImages.length,1);await view.onClose();
+    const testCase=await pausedDraftPreflight(kind),{view}=testCase,newDraft='NEW_DRAFT_AFTER_SEND\nkeep this';view.input.value=newDraft;view.input.setSelectionRange(2,9);if(action==='stop'){view.sendButton.click();testCase.release();}else testCase.fail();await testCase.pending;assert.equal(testCase.generations,0,kind+' '+action);assert.equal(view.input.value,newDraft);assert.equal(view.input.selectionStart,2);assert.equal(view.input.selectionEnd,9);assert.equal(view.session.entries.length,0);assert.equal(view.messages.length,0);if(kind==='vision')assert.equal(view.pendingFiles.length,1);await view.onClose();
   }
 });
 
@@ -1771,7 +1683,7 @@ test('context and cache metrics keep both values separate and preserve full acce
 test('composer keyboard order matches the compact toolbar and reasoning remains last',async()=>{
   const env=ui(async()=>{},async()=>'',{saved:{uiLanguage:'en'}});await env.plugin.onload();const view=env.plugin.factory({});await view.onOpen();
   const controls=[...env.doc.querySelector('.sd-actions').querySelectorAll('button,input,select')],speed=env.doc.querySelector('.sd-speed input');
-  assert.deepEqual(controls,[view.uploadButton,view.sendButton,view.compressButton,view.clearButton,speed,view.searchFetchToggle,view.effortSelect]);assert.equal(speed.max,'301');assert.equal(speed.value,'301');assert.equal(view.effortSelect.value,'low');assert.equal(view.notebookPanel.hidden,true);await view.onClose();
+  assert.deepEqual(controls.slice(1),[view.uploadButton,view.sendButton,view.compressButton,view.clearButton,view.conversionButton,view.searchFetchToggle,view.effortSelect]);assert.equal(controls[0].speechCode,'dictate');assert.equal(speed,null);assert.equal(view.effortSelect.value,'low');assert.equal(view.notebookPanel.hidden,true);await view.onClose();
 });
 
 test('conversation search keeps only its current highlight without a forced layout read',async()=>{
@@ -1846,4 +1758,15 @@ test('slow conversation recycling locks review actions and failed recycling rest
 
 test('a review confirmation cannot apply a Notebook patch while conversation recycling is pending',async()=>{
   const {env,view,state,entry}=await completedNotebookUi();env.doc.querySelector('.sd-notebook-apply').click();await uiEventually(()=>env.doc.querySelector('.sd-confirm'));let failTrash;env.plugin.conversationStore.remove=()=>new Promise((resolve,reject)=>failTrash=()=>reject(Error('trash unavailable')));const clearing=view.clear();await uiEventually(()=>failTrash);env.doc.querySelector('.sd-confirm .mod-cta').click();await new Promise(setImmediate);assert.equal(state.applied,0);assert.equal(entry.notebookApplied,undefined);assert.equal(env.doc.querySelector('.sd-confirm'),null);failTrash();await clearing;assert.equal(state.applied,0);assert.equal(env.doc.querySelector('.sd-notebook-apply').disabled,false);await view.onClose();
+});
+
+test('native file references survive a fresh plugin instance and fail visibly when cloud files expire',async()=>{
+  const env=ui(async(k,m,s,d)=>d('First answer'),async()=> '');await env.plugin.onload();env.plugin.keys.deepseek='key';const view=env.plugin.factory({});await view.onOpen();await view.upload(attachedImage());view.input.value='Inspect';await view.send();const fileId=view.session.entries[0].files[0].id;await view.onClose();
+  let calls=0;const restored=ui(async()=>{calls++;},async()=>'',{saved:env.saved.at(-1),conversationState:env.conversationState,deepseekFiles:{validateFiles:async()=>{throw Object.assign(Error('Attach the original file again.'),{code:'FILE_UNAVAILABLE',fileId});}}});await restored.plugin.onload();restored.plugin.keys.deepseek='key';const next=restored.plugin.factory({});await next.onOpen();assert.equal(next.messages[0].content[1].file_id,fileId);next.input.value='Read again';await next.send();assert.equal(calls,0);assert.equal(next.input.value,'Read again');assert.match(next.status.textContent,/original file/);assert.equal(next.session.entries.length,2);await next.onClose();
+});
+
+test('file conversion picker uses MinerU and presents Markdown without adding it to subsequent chat requests',async()=>{
+  const parsed=[],requests=[];const env=ui(async(k,m,s,d)=>{requests.push(structuredClone(m));d('Answer');},async(file,key)=>{parsed.push({name:file.name,key});return '# Converted document';});await env.plugin.onload();env.plugin.keys={deepseek:'chat-key',mineru:'parse-key'};const view=env.plugin.factory({});await view.onOpen();const picker=[...env.doc.querySelectorAll('input[type="file"]')].find(input=>input!==view.file);assert.ok(picker);
+  Object.defineProperty(picker,'files',{value:[pdfFile],configurable:true});picker.dispatchEvent(new env.dom.window.Event('change'));await uiEventually(()=>!view.controller&&view.session.entries.length===1);assert.deepEqual(parsed,[{name:'sample.pdf',key:'parse-key'}]);assert.equal(view.session.entries[0].raw,'# Converted document');assert.equal(view.messages.length,0);assert.equal(view.pendingFiles.length,0);assert.equal(env.fileUploads.length,0);
+  view.input.value='Hello';await view.send();assert.ok(!JSON.stringify(requests).includes('Converted document'));await view.onClose();
 });

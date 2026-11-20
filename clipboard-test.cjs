@@ -27,3 +27,13 @@ test('paste resolves file URI and Windows FileNameW only for supported local fil
     assert.equal(fromExplorer[0].filePath, filePath);
   }
 });
+
+test('chat paste supports the same document formats as the picker for files and local URIs', () => {
+  const names = ['paper.DOCX', 'data.xlsx', 'notes.md', 'figure.tif'];
+  const direct = clipboardAttachments({ files: [...names, 'conversion-only.jp2'].map(name => ({name})) });
+  assert.deepEqual(direct.map(item => item.name), names);
+  const paths = names.map(name => path.join(__dirname, name));
+  const uris = paths.map(file => pathToFileURL(file).href).join('\r\n');
+  assert.deepEqual(clipboardAttachments({ getData: () => uris }).map(item => item.filePath), paths);
+  assert.equal(clipboardAttachments({ files: [{name:'',type:'image/tiff'}] })[0].name,'clipboard.tiff');
+});

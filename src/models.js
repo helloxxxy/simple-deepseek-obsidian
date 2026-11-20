@@ -3,6 +3,11 @@ const { createHash } = require('node:crypto');
 const DEFAULT_CONTEXT_WINDOW = 1048576;
 const DEFAULT_MAX_OUTPUT = 393216;
 const positiveInteger = value => Number.isSafeInteger(value) && value > 0;
+// The two legacy Flash IDs resolve to the same documented model on DeepSeek.
+const isFlashModel = id => ['deepseek-flash','deepseek-v4-flash','deepseek-v4-flash-vision-exp'].includes(id);
+function assertFileModel(id) {
+  if (id === 'deepseek-v4-pro') throw Error('此对话包含文件附件，请切换到 deepseek-flash 后继续。');
+}
 const check = signal => { if (signal?.aborted) { const error = Error('已停止'); error.name = 'AbortError'; throw error; } };
 function modelCapabilities(id, record = null) {
   const contextWindow = positiveInteger(record?.context_window) ? record.context_window : DEFAULT_CONTEXT_WINDOW;
@@ -11,7 +16,7 @@ function modelCapabilities(id, record = null) {
   return Object.freeze({
     id, name: typeof record?.name === 'string' && record.name.trim() ? record.name : id,
     contextWindow, maxOutputTokens,
-    inputModalities: Object.freeze(Array.isArray(record?.input_modalities) ? record.input_modalities.filter(value => ['text','image'].includes(value)) : (/^deepseek-(?:flash|v4-flash|v4-flash-vision-exp)$/.test(id) ? ['text','image'] : ['text'])),
+    inputModalities: Object.freeze(Array.isArray(record?.input_modalities) ? record.input_modalities.filter(value => ['text','image'].includes(value)) : (isFlashModel(id) ? ['text','image'] : ['text'])),
     reasoningEfforts: Object.freeze(levels.length ? levels : ['low','high','max']),
     defaultEffort: levels.includes(record?.effort?.default_level) ? record.effort.default_level : (levels[0] || 'high'),
     discovered: !!record
@@ -49,4 +54,4 @@ class ModelCatalog {
     return modelCapabilities(model, entry.records.get(model));
   }
 }
-module.exports = { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, modelCapabilities, assertReasoningEffort, ModelCatalog };
+module.exports = { DEFAULT_CONTEXT_WINDOW, DEFAULT_MAX_OUTPUT, modelCapabilities, assertReasoningEffort, isFlashModel, assertFileModel, ModelCatalog };

@@ -13,7 +13,7 @@ const response = value => ({ ok: true, status: 200, json: async () => value });
 
 function transport({ autoOpen = true, autoSync = true, fetchImpl = async url => response(url.includes('/api/sessions') ? [{ path: 'test.ipynb', kernel: { id: 'kernel-1' } }] : { roomId: 'test-room', sessionId: 'rtc-session' }), timeout = 50 } = {}) {
   const filename = path.join(__dirname, 'src', 'notebook.js'), originalRequire = createRequire(filename);
-  const sockets = [], notebooks = [], statuses = [];
+  const sockets = [], notebooks = [], statuses = []; let notebookModuleLoads = 0;
   class Notebook {
     constructor() { this.ydoc = new EventEmitter(); this.disposals = 0; this.snapshot = data(); notebooks.push(this); }
     toJSON() { if (this.disposals) throw Error('disposed notebook read'); return structuredClone(this.snapshot); }
@@ -30,7 +30,7 @@ function transport({ autoOpen = true, autoSync = true, fetchImpl = async url => 
   }
   const sandbox = { module: { exports: {} }, exports: {}, URL, URLSearchParams, Buffer, Uint8Array, AbortController, setTimeout, clearTimeout, setInterval, clearInterval,
     require(name) {
-      if (name === '@jupyter/ydoc') return { YNotebook: Notebook };
+      if (name === '@jupyter/ydoc') { notebookModuleLoads++; return { YNotebook: Notebook }; }
       if (name === 'ws') return { WebSocket: Socket };
       if (name === 'y-protocols/sync.js') return { writeSyncStep1() {}, writeUpdate() {}, readSyncMessage() {} };
       return originalRequire(name);
@@ -38,8 +38,13 @@ function transport({ autoOpen = true, autoSync = true, fetchImpl = async url => 
   };
   vm.runInNewContext(readFileSync(filename, 'utf8'), sandbox, { filename });
   const client = new sandbox.module.exports.JupyterRtcClient({ baseUrl: 'http://127.0.0.1:8888', notebookPath: 'test.ipynb', fetchImpl, timeout, restTimeout: 50, onStatus: (status, error) => statuses.push({ status, error }) });
-  return { client, sockets, notebooks, statuses, inject() { const notebook = new Notebook(); client.socket = { synced: true, notebook }; return notebook; } };
+  return { client, sockets, notebooks, statuses, notebookModuleLoads: () => notebookModuleLoads, inject() { const notebook = new Notebook(); client.socket = { synced: true, notebook }; return notebook; } };
 }
+
+test('Notebook text utilities and client creation do not load YNotebook until the first RTC connection',async()=>{
+ const state=transport();assert.equal(state.notebookModuleLoads(),0);assert.equal(state.notebooks.length,0);
+ try{await state.client.connect();assert.equal(state.notebookModuleLoads(),1);assert.equal(state.client.connected,true);assert.deepEqual(JSON.parse(JSON.stringify(state.client.read())),data());}finally{state.client.close();}
+});
 
 test('REST timeout aborts the actual transport signal rather than only abandoning the response', async () => {
   let received;
@@ -101,6 +106,23 @@ test('a remote RTC close after synchronization invalidates read and ignores ever
   assert.throws(() => state.client.read(), /尚未连接/); assert.equal(state.client.socket, null); assert.equal(state.notebooks[0].disposals, 1);
   socket.open(); socket.emit('message', new Uint8Array([0, 1])); wrapper.notebook.ydoc.emit('update', new Uint8Array(), wrapper); socket.emit('error', Error('late failure'));
   assert.equal(socket.sent.length, sent); assert.equal(updates, 0); assert.equal(state.statuses.filter(item => item.status === 'connected').length, 1); assert.equal(state.statuses.filter(item => item.status === 'disconnected').length, 1);
+});
+test('RTC bursts share one derived snapshot while explicit reads always observe the latest document',async()=>{
+ const state=transport();await state.client.connect();state.client.changeNotifyDelay=10;
+ const wrapper=state.client.socket,notebook=wrapper.notebook,original=notebook.toJSON.bind(notebook);let reads=0,notifications=0,resolveUpdate;
+ notebook.toJSON=()=>{reads++;return original();};const received=new Promise(resolve=>{resolveUpdate=resolve;});
+ const unsubscribe=state.client.onChange(value=>{notifications++;resolveUpdate(value);});
+ try{
+  for(let index=0;index<40;index++){notebook.snapshot.cells=[{id:'cell',cell_type:'code',source:String(index),outputs:[]}];notebook.ydoc.emit('update',new Uint8Array(),wrapper);}
+  assert.equal(reads,0);assert.equal(notifications,0);assert.equal(state.client.read().cells[0].source,'39');assert.equal(reads,1);
+  const value=await received;assert.equal(value.cells[0].source,'39');assert.equal(reads,2);assert.equal(notifications,1);
+  unsubscribe();notebook.ydoc.emit('update',new Uint8Array(),wrapper);assert.equal(state.client.changeTimer,null);
+  state.client.onChange(()=>notifications++);notebook.ydoc.emit('update',new Uint8Array(),wrapper);assert.notEqual(state.client.changeTimer,null);state.client.close();await new Promise(resolve=>setTimeout(resolve,20));assert.equal(reads,2);assert.equal(notifications,1);
+ }finally{state.client.close();}
+});
+test('Kernel discovery ignores Console and malformed sessions before the matching Notebook',async()=>{
+ let creates=0;const state=transport({fetchImpl:async(_url,options)=>{if(options?.method==='POST')creates++;return response([{type:'console',path:'console-1',kernel:{id:'console-kernel'}},{type:'notebook',path:null,kernel:{id:'invalid'}},null,{type:'notebook',path:'other.py',kernel:{id:'script'}},{type:'notebook',path:'test.ipynb',kernel:{id:'matching-kernel'}}]);}});state.inject();
+ try{const kernel=await state.client.ensureKernel();assert.equal(kernel.id,'matching-kernel');assert.equal(creates,0);assert.ok(state.sockets[0].url.includes('/api/kernels/matching-kernel/channels'));}finally{state.client.close();}
 });
 
 test('closing a pending RTC handshake releases its notebook and never announces connected', async () => {

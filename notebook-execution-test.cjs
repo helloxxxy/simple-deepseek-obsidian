@@ -17,6 +17,27 @@ const setup = (data = fixture()) => {
 };
 const conflict = reason => error => error.code === 'NOTEBOOK_EXECUTION_CONFLICT' && error.reason === reason && error.outputsDiscarded === true;
 
+test('display updates reach every matching output without persisting transient display IDs',async()=>{
+ const {model,client}=setup(),display=(type,text,extra={})=>({channel:'iopub',header:{msg_type:type},content:{data:{'text/plain':text},metadata:{revision:text},transient:{display_id:'same-display'},...extra}});
+ try{
+  client.kernelRequest=async()=>[display('display_data','before'),display('execute_result','before',{execution_count:3}),display('update_display_data','after'),{channel:'shell',header:{msg_type:'execute_reply'},content:{execution_count:3}}];
+  await client.executeCell(0);const outputs=client.read().cells[0].outputs;
+  assert.equal(outputs.length,2);assert.ok(outputs.every(output=>output.data['text/plain']==='after'&&output.metadata.revision==='after'));assert.equal(outputs[1].output_type,'execute_result');assert.equal(outputs[1].execution_count,3);assert.ok(!JSON.stringify(outputs).includes('transient'));assert.ok(!JSON.stringify(outputs).includes('display_id'));
+ }finally{model.dispose();}
+});
+test('clear_output wait preserves current output until a replacement arrives',()=>{
+ const {model,client}=setup(),message=(type,content)=>({channel:'iopub',header:{msg_type:type},content});
+ const before=message('stream',{name:'stdout',text:'keep'}),later=message('stream',{name:'stdout',text:'replacement'}),wait=message('clear_output',{wait:true});
+ try{
+  assert.deepEqual(client.messagesToOutputs([before,wait]),[{output_type:'stream',name:'stdout',text:'keep'}]);
+  assert.deepEqual(client.messagesToOutputs([before,wait,later]),[{output_type:'stream',name:'stdout',text:'replacement'}]);
+  assert.deepEqual(client.messagesToOutputs([before,message('clear_output',{wait:false})]),[]);
+  assert.deepEqual(client.messagesToOutputs([before,wait,message('status',{execution_state:'idle'})]),[{output_type:'stream',name:'stdout',text:'keep'}]);
+  const old=message('display_data',{data:{'text/plain':'old'},transient:{display_id:'old-id'}}),update=message('update_display_data',{data:{'text/plain':'new'},transient:{display_id:'old-id'}});
+  assert.deepEqual(client.messagesToOutputs([old,message('clear_output',{wait:false}),update]),[]);
+ }finally{model.dispose();}
+});
+
 test('execution output follows its original cell when a manual cell is inserted before it', async () => {
   const { model, client } = setup();
   try {

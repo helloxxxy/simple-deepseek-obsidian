@@ -1,7 +1,7 @@
 const { chat, check } = require('./core');
 const { estimateText, outputBudget } = require('./context');
 const { copyMessage } = require('./history');
-const { webTools, safeWebText } = require('./web');
+const { webTools, safeWebText, contentHash } = require('./web');
 const { safeNotebook } = require('./notebook');
 const { TOOL_PROTOCOL_MESSAGES, textualToolRequest, ProtocolTextBuffer } = require('./tool-protocol');
 const DEFAULT_BATCH_TOKENS = 4096, MIN_BATCH_TOKENS = 512, MAX_RECOVERY_FAILURES = 3, MAX_SOURCE_READ = 12000, MAX_INDEX_PREVIEW = 200;
@@ -41,9 +41,14 @@ const readImageTool = {
     }, required: ['imageIds','question'], additionalProperties: false }
   }
 };
-function turnTools(notebook, webEnabled = true, images = null, batchTokens = DEFAULT_BATCH_TOKENS) {
+function turnTools(notebook, webEnabled = true, images = null, batchTokens = DEFAULT_BATCH_TOKENS, nativeWeb = false) {
+  if (nativeWeb && webEnabled && !notebook && !images) return [{type:'deepseek_web_search'},{type:'deepseek_read_url'}];
   const stage = {...notebookTool,function:{...notebookTool.function,description:notebookTool.function.description+' Current recommendedBatchTokens: '+batchTokens+'.'}};
   return [...(webEnabled ? webTools : []), ...(notebook ? [stage, readNotebookTool] : []), ...(images ? [readImageTool] : [])];
+}
+function toolSchemaMetadata(tools) {
+  const serialized = tools.length ? JSON.stringify(tools) : '';
+  return {schemaTokens:serialized ? estimateText(serialized)+16 : 0,schemaHash:serialized ? contentHash(serialized) : ''};
 }
 function imageArguments(args) {
   if (Object.keys(args).some(name => !['imageIds','question','region'].includes(name)) || !Array.isArray(args.imageIds) || !args.imageIds.length || args.imageIds.some(id => typeof id !== 'string' || !id.trim()) || new Set(args.imageIds).size !== args.imageIds.length || typeof args.question !== 'string' || !args.question.trim()) throw Error('read_image requires unique nonempty imageIds and a nonempty question.');
@@ -102,6 +107,10 @@ function addUsage(total, usage) {
   total ||= {};
   for (const field of ['prompt_tokens','completion_tokens','prompt_cache_hit_tokens','prompt_cache_miss_tokens','total_tokens']) if (Number.isFinite(usage[field])) total[field] = (total[field] || 0) + usage[field];
   if (Number.isFinite(usage.completion_tokens_details?.reasoning_tokens)) total.completion_tokens_details = {reasoning_tokens:(total.completion_tokens_details?.reasoning_tokens || 0)+usage.completion_tokens_details.reasoning_tokens};
+  if (usage.server_tool_use) {
+    total.server_tool_use ||= {};
+    for (const [name,count] of Object.entries(usage.server_tool_use)) if (Number.isFinite(count) && count >= 0) total.server_tool_use[name] = (total.server_tool_use[name] || 0) + count;
+  }
   return total;
 }
 function resultProgressKey(name, result) {
@@ -124,7 +133,7 @@ function toolSignature(call, args) {
 }
 function unavailableBatch(error, tools) {
   if (error?.category !== 'unavailable_tool' || error.incomplete !== false || error.finishReason !== 'tool_calls' || !Array.isArray(error.toolCalls) || !error.toolCalls.length) return null;
-  const available = new Set(tools.map(tool => tool.function.name)), ids = new Set();
+  const available = new Set(tools.filter(tool => tool.type === 'function').map(tool => tool.function.name)), ids = new Set();
   for (const call of error.toolCalls) {
     if (!call || typeof call.id !== 'string' || !call.id || ids.has(call.id) || call.type !== 'function' || typeof call.function?.name !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(call.function.name) || typeof call.function.arguments !== 'string') return null;
     ids.add(call.id);
@@ -134,10 +143,10 @@ function unavailableBatch(error, tools) {
   }
   const unavailableTools = [...new Set(error.toolCalls.filter(call => !available.has(call.function.name)).map(call => call.function.name))];
   if (!unavailableTools.length) return null;
-  return { calls: copyMessage({role:'assistant',content:'',tool_calls:error.toolCalls}).tool_calls, unavailableTools, availableTools:[...available] };
+  return { calls: copyMessage({role:'assistant',content:'',tool_calls:error.toolCalls}).tool_calls, unavailableTools, availableTools:tools.map(tool => tool.function?.name || tool.type) };
 }
-async function runToolTurn({ key, session, signal, model, reasoningEffort, systemPrompt, capabilities, web, webEnabled = true, notebook = null, notebookAvailable = () => true, images = null, userText,
-  send = chat, onRawText = () => {}, onText = () => {}, onThinking = () => {}, onToolProgress = () => {}, onMessage = () => {}, onRecord = () => {}, onUsage = () => {}, onStatus = () => {}, onProtocolIssue = () => {}, onCheckpoint = async () => {}, beforeRequest = async () => {} }) {
+async function runToolTurn({ key, session, signal, model, reasoningEffort, systemPrompt, capabilities, web, webEnabled = true, nativeWeb = false, notebook = null, notebookAvailable = () => true, images = null, userText,
+  send = chat, onRawText = () => {}, onText = () => {}, onThinking = () => {}, onToolProgress = () => {}, onServerToolEvent = () => {}, onAnnotations = () => {}, onMessage = () => {}, onRecord = () => {}, onUsage = () => {}, onStatus = () => {}, onProtocolIssue = () => {}, onCheckpoint = async () => {}, beforeRequest = async () => {} }) {
   let recommendedBatchTokens = DEFAULT_BATCH_TOKENS, lengthFailures = 0, toolFailures = 0;
   let notebookRevoked = false;
   const currentNotebook = () => {
@@ -145,9 +154,10 @@ async function runToolTurn({ key, session, signal, model, reasoningEffort, syste
     try { notebookRevoked = !notebookAvailable(); } catch { notebookRevoked = true; }
     return notebookRevoked ? null : notebook;
   };
-  let tools = turnTools(currentNotebook(), webEnabled, images, recommendedBatchTokens);
+  let tools = turnTools(currentNotebook(), webEnabled, images, recommendedBatchTokens, nativeWeb);
   const metadata = {model,systemPrompt,includeReasoning:tools.length > 0};
-  const originalRequest = userText ?? [...session.messages].reverse().find(message => message.role === 'user')?.content ?? '';
+  const suppliedRequest = userText ?? [...session.messages].reverse().find(message => message.role === 'user')?.content ?? '';
+  const originalRequest = Array.isArray(suppliedRequest) ? suppliedRequest.filter(part => part.type === 'text').map(part => part.text).join('\n') : suppliedRequest;
   let totalUsage = null, hasText = false, observedCompactions = session.compactions || 0;
   let protocolAttempts = 0, protocolCorrectionUsed = false, recoveryPending = false, unavailableAttempts = 0;
   const failures = new Set(), truncations = new Set();
@@ -160,21 +170,22 @@ async function runToolTurn({ key, session, signal, model, reasoningEffort, syste
   try { while (true) {
     check(signal);
     const notebookForRequest = currentNotebook();
-    tools = turnTools(notebookForRequest, webEnabled, images, recommendedBatchTokens);
-    let schemaTokens = tools.length ? estimateText(JSON.stringify(tools)) + 16 : 0;
-    await beforeRequest(schemaTokens); check(signal);
+    tools = turnTools(notebookForRequest, webEnabled, images, recommendedBatchTokens, nativeWeb);
+    let schema = toolSchemaMetadata(tools);
+    await beforeRequest(schema.schemaTokens,{...schema}); check(signal);
     if (notebookForRequest !== currentNotebook()) {
-      tools = turnTools(null, webEnabled, images, recommendedBatchTokens);
-      schemaTokens = tools.length ? estimateText(JSON.stringify(tools)) + 16 : 0;
+      tools = turnTools(null, webEnabled, images, recommendedBatchTokens, nativeWeb);
+      schema = toolSchemaMetadata(tools);
     }
     metadata.includeReasoning = tools.length > 0;
+    Object.assign(metadata,schema);
     if ((session.compactions || 0) !== observedCompactions) { successfulResults.clear(); observedCompactions = session.compactions || 0; }
     const prior = session.messages.map(message => { const copy = copyMessage(message); if (!tools.length) delete copy.reasoning_content; return copy; }), assistant = {role:'assistant',content:'',reasoning_content:''};
     let attached = false, calls = [], usage, failure, requested = false, accepting = true;
     const attach = () => { if (!attached) { append(assistant); attached = true; } };
     const visible = new ProtocolTextBuffer({userText:originalRequest,onText:delta => { if (!signal?.aborted) { hasText = true; onText(delta); } }});
     try {
-      const maxOutputTokens = outputBudget(session, schemaTokens, capabilities, metadata);
+      const maxOutputTokens = outputBudget(session, schema.schemaTokens, capabilities, metadata);
       requested = true;
       usage = await send(key, [{role:'system',content:systemPrompt}, ...prior], signal, delta => {
         if (!accepting || signal?.aborted || !delta) return; attach(); assistant.content += delta; onRawText(delta); visible.push(delta);
@@ -182,6 +193,9 @@ async function runToolTurn({ key, session, signal, model, reasoningEffort, syste
         model, reasoningEffort, tools, maxOutputTokens,
         onThinking: delta => { if (!accepting || signal?.aborted || !delta) return; attach(); assistant.reasoning_content = (assistant.reasoning_content || '') + delta; onThinking(delta); },
         onToolProgress: progress => { if (accepting && !signal?.aborted) onToolProgress(progress); },
+        onServerToolEvent: event => { if (accepting && !signal?.aborted) { onServerToolEvent(event); onRecord({type:'server_tool_event',event}); } },
+        onServerToolCalls: (steps, state = {}) => { if (accepting && !signal?.aborted) { attach(); assistant.server_tool_calls = steps; if (typeof state.reasoningContent === 'string') assistant.reasoning_content = state.reasoningContent; } },
+        onAnnotations: annotations => { if (accepting && !signal?.aborted) { attach(); assistant.annotations = annotations; onAnnotations(annotations); } },
         onToolCalls: value => { if (accepting && !signal?.aborted) calls = value; }
       });
       check(signal);
@@ -193,7 +207,7 @@ async function runToolTurn({ key, session, signal, model, reasoningEffort, syste
     if (rejected) { calls = rejected.calls; failure = null; }
     if (calls.length && !failure) { attach(); assistant.tool_calls = calls; }
     if (attached || failure) onRecord({type:'response',message:copyMessage(assistant),...(failure ? {error:failure.message,finishReason:failure.finishReason,unfinishedToolCalls:failure.toolCalls || []} : {}),...(rejected ? {rejectedToolCalls:copyMessage(assistant).tool_calls,rejection:{category:rejection.category,error:rejection.message,finishReason:rejection.finishReason,unavailableTools:rejected.unavailableTools}} : {})});
-    if (requested) { totalUsage = addUsage(totalUsage, usage); onUsage(usage, assistant, {includeReasoning:metadata.includeReasoning}); }
+    if (requested) { totalUsage = addUsage(totalUsage, usage); onUsage(usage, assistant, {includeReasoning:metadata.includeReasoning,...schema,...(tools.some(tool => tool.type.startsWith('deepseek_')) ? {aggregateUsage:true} : {})}); }
     if (rejected) {
       let repeated = false;
       for (const call of calls) {
@@ -335,4 +349,4 @@ async function runToolTurn({ key, session, signal, model, reasoningEffort, syste
     error.turnUsage = totalUsage; error.stagedPatch = finishPatch(); throw error;
   }
 }
-module.exports = { notebookTool, readNotebookTool, readImageTool, turnTools, runToolTurn, addUsage, textualToolRequest, TOOL_PROTOCOL_MESSAGES, DEFAULT_BATCH_TOKENS, MIN_BATCH_TOKENS, MAX_RECOVERY_FAILURES };
+module.exports = { notebookTool, readNotebookTool, readImageTool, turnTools, toolSchemaMetadata, runToolTurn, addUsage, textualToolRequest, TOOL_PROTOCOL_MESSAGES, DEFAULT_BATCH_TOKENS, MIN_BATCH_TOKENS, MAX_RECOVERY_FAILURES };

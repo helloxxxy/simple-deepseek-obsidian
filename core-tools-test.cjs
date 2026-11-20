@@ -9,6 +9,47 @@ const finish = reason => event({}, reason, usage) + 'data: [DONE]\n\n';
 const call = (index, id, name, arguments_) => ({ index, id, type: 'function', function: { name, arguments: arguments_ } });
 const signal = () => new AbortController().signal;
 
+test('server web streams retain final signatures and citations and assign only final-step reasoning', async () => {
+  const serverTools = [{type:'deepseek_web_search'},{type:'deepseek_read_url'}];
+  const serverCalls = [{index:0,reasoning_content:'First step.',calls:[{index:0,id:'srv-1',type:'deepseek_read_url',kind:'read_link',action:{type:'read_link',url:'https://example.com'},status:'completed',page:{url:'https://example.com',title:'Example'},signature:'opaque-signature'}]}];
+  const citations = [{type:'url_citation',url_citation:{url:'https://example.com',title:'Example',start_index:0,end_index:3}}];
+  const events = [], thoughts = [];
+  let received, receivedCitations;
+  const finalUsage = {...usage,server_tool_use:{tool_fetch:1}};
+  const wire = event({reasoning_content:'First step.'})
+    + 'data: '+JSON.stringify({choices:[{delta:{},server_tool_event:{type:'step_reasoning_done',step:0}}]})+'\n\n'
+    + 'data: '+JSON.stringify({choices:[{delta:{},server_tool_event:{type:'call_completed',step:0,call:{...serverCalls[0].calls[0],signature:undefined}}}]})+'\n\n'
+    + event({reasoning_content:'Final step.',content:'A🌱B'})
+    + event({server_tool_calls:serverCalls,annotations:citations},'stop',finalUsage)+'data: [DONE]\n\n';
+  const result = await chat('key',[],signal(),()=>{},async(_url,options)=>{
+    assert.deepEqual(JSON.parse(options.body).tools,serverTools);
+    for (const byte of Buffer.from(wire)) options.onChunk(Buffer.from([byte]));
+  },{tools:serverTools,onThinking:text=>thoughts.push(text),onServerToolEvent:value=>events.push(value),onServerToolCalls:(steps,state)=>{received={steps,state};},onAnnotations:value=>{receivedCitations=value;}});
+  assert.equal(thoughts.join(''),'First step.Final step.');
+  assert.equal(events.length,2);
+  assert.deepEqual(received,{steps:serverCalls,state:{reasoningContent:'Final step.'}});
+  assert.deepEqual(receivedCitations,citations);
+  assert.deepEqual(result,finalUsage);
+});
+
+test('native server tools reject mixed client functions and JSON output before transport', async () => {
+  let requests=0;
+  const http=async()=>{requests++;};
+  await assert.rejects(chat('key',[],signal(),()=>{},http,{tools:[{type:'deepseek_web_search'},tools[0]]}),/separate requests/);
+  await assert.rejects(chat('key',[],signal(),()=>{},http,{tools:[{type:'deepseek_web_search'}],responseFormat:{type:'json_object'}}),/text output/);
+  assert.equal(requests,0);
+});
+
+test('server HTTP-200 generation failure preserves billed usage without a successful end', async () => {
+  await assert.rejects(chat('key',[],signal(),()=>{},async(_url,options)=>{
+    options.onChunk(Buffer.from(event({content:'Partial'})+'data: '+JSON.stringify({choices:[],error:{message:'Generation failed'},usage})+'\n\n'));
+  },{tools:[{type:'deepseek_web_search'}]}),error=>{
+    assert.deepEqual(error.usage,usage);
+    assert.match(error.message,/Generation failed/);
+    return true;
+  });
+});
+
 test('chat preserves plain requests and existing reasoning/tool messages without adding tools or JSON mode', async () => {
   const messages = [
     { role: 'assistant', content: null, reasoning_content: 'original reasoning', tool_calls: [{ id: 'prior', type: 'function', function: { name: 'fetch', arguments: '{"url":"https://example.com"}' } }] },
@@ -317,4 +358,77 @@ test('abortableTask preserves task results and removes its abort listener after 
   const promise=Promise.resolve('same promise');assert.equal(abortableTask(promise),promise);
   const cancelled=new AbortController();cancelled.abort();
   await assert.rejects(abortableTask(Promise.resolve('late value'),cancelled.signal),{name:'AbortError'});
+});
+
+test('PDF reads release on Stop, consume late failures and never create a cloud task',async()=>{
+  const {parseFile}=require('./src/core');
+  const controller=new AbortController();let failRead,reads=0;
+  const pending=parseFile({name:'waiting.pdf',size:1,arrayBuffer:()=>{reads++;return new Promise((_resolve,reject)=>{failRead=reject;});}},'fake',controller.signal,()=>{},()=>assert.fail('Cancelled read reached HTTP'));
+  await Promise.resolve();assert.equal(reads,1);controller.abort();
+  await assert.rejects(pending,{name:'AbortError'});
+  failRead(Error('Late filesystem failure'));await new Promise(setImmediate);
+  await assert.rejects(parseFile({name:'already-stopped.pdf',size:1,arrayBuffer:()=>assert.fail('Stopped file was read')},'fake',controller.signal),{name:'AbortError'});
+  const immediate=new AbortController();
+  const neverRead=parseFile({name:'stop-before-read.pdf',size:1,arrayBuffer:()=>assert.fail('Read started after Stop')},'fake',immediate.signal);
+  immediate.abort();await assert.rejects(neverRead,{name:'AbortError'});
+});
+
+test('PDF dependency is initialized only when decoding a PDF, not when loading core or using another file type',async()=>{
+  const filename=require.resolve('./src/core'),source=require('node:fs').readFileSync(filename,'utf8'),localModule={exports:{}};
+  const scopedRequire=require('node:module').createRequire(filename);let pdfLoads=0;
+  require('node:vm').compileFunction(source,['require','module','exports'],{filename})(name=>{if(name==='pdf-lib')pdfLoads++;return scopedRequire(name);},localModule,localModule.exports);
+  assert.equal(pdfLoads,0);
+  await assert.rejects(localModule.exports.parseFile({name:'image.png',size:1,arrayBuffer:async()=>Buffer.from('x')},'fake',signal(),()=>{},async()=>Buffer.from('{"code":"A0202"}')),/密钥错误/);
+  assert.equal(pdfLoads,0);
+  await assert.rejects(localModule.exports.parseFile({name:'broken.pdf',size:1,arrayBuffer:async()=>Buffer.from('x')},'fake',signal(),()=>{},()=>assert.fail('Invalid PDF reached HTTP')),/无法读取 PDF 页数/);
+  assert.equal(pdfLoads,1);
+});
+
+test('PDF read failures retain their file error and cancellation after decoding cannot start an upload',async()=>{
+  const {parseFile}=require('./src/core'),{PDFDocument}=require('pdf-lib');
+  await assert.rejects(parseFile({name:'unreadable.pdf',size:1,arrayBuffer:async()=>{throw Error('private path');}},'fake',signal(),()=>{},()=>assert.fail('Failed read reached HTTP')),/无法读取 PDF 文件/);
+  const document=await PDFDocument.create();document.addPage();const bytes=Buffer.from(await document.save());
+  const controller=new AbortController(),load=PDFDocument.load;
+  PDFDocument.load=async(...args)=>{const result=await load.apply(PDFDocument,args);controller.abort();return result;};
+  try { await assert.rejects(parseFile({name:'decode.pdf',size:bytes.length,arrayBuffer:async()=>bytes},'fake',controller.signal,()=>{},()=>assert.fail('Cancelled decode created a task')),{name:'AbortError'}); }
+  finally { PDFDocument.load=load; }
+});
+
+test('parallel PDF transfers stop dispatching on first failure or Stop, abort peers and drain workers',async()=>{
+  const {parseFile}=require('./src/core'),{PDFDocument}=require('pdf-lib');
+  const document=await PDFDocument.create();for(let i=0;i<801;i++)document.addPage([10,10]);
+  const pdf=Buffer.from(await document.save()),file={name:'five-parts.pdf',size:pdf.length,arrayBuffer:async()=>pdf};
+  for(const phase of ['upload','download'])for(const ending of ['failure','stop']){
+    const controller=new AbortController(),started=[],aborted=[],cleanup=[],progress=[];
+    let ready,failFirst,files,settled=false;
+    const active=new Promise(resolve=>{ready=resolve;}),failure=Error('First '+phase+' failed');
+    const http=async(url,options={})=>{
+      if(url.endsWith('file-urls/batch')){files=JSON.parse(options.body).files;return Buffer.from(JSON.stringify({code:0,data:{batch_id:'offline',file_urls:files.map((_,i)=>'https://offline.invalid/upload/'+i)}}));}
+      if(url.includes('extract-results/batch/'))return Buffer.from(JSON.stringify({code:0,data:{extract_result:files.map((file,i)=>({data_id:file.data_id,state:'done',full_zip_url:'https://offline.invalid/download/'+i}))}}));
+      const actual=options.method==='PUT'?'upload':'download';
+      if(actual!==phase)return Buffer.alloc(0);
+      const index=Number(url.split('/').at(-1));started.push(index);
+      const result=new Promise((_resolve,reject)=>{
+        if(index===0)failFirst=()=>reject(failure);
+        const abort=()=>{aborted.push(index);cleanup.push(()=>reject(Object.assign(Error('Peer stopped'),{name:'AbortError'})));};
+        options.signal.addEventListener('abort',abort,{once:true});
+        if(options.signal.aborted)abort();
+      });
+      if(started.length===4)ready();
+      return result;
+    };
+    const result=parseFile(file,'fake',controller.signal,value=>progress.push(value),http,async()=>{}).then(value=>({value}),error=>({error})).then(value=>{settled=true;return value;});
+    await active;
+    if(ending==='stop')controller.abort();else failFirst();
+    await new Promise(setImmediate);
+    assert.equal(settled,false,'Caller must wait for cancelled peers to finish');
+    assert.deepEqual(started,[0,1,2,3]);assert.ok([1,2,3].every(index=>aborted.includes(index)));
+    const progressAtFailure=progress.length;
+    for(const finish of cleanup)finish();
+    const outcome=await result;
+    if(ending==='stop')assert.equal(outcome.error.name,'AbortError');else assert.equal(outcome.error,failure);
+    await new Promise(setImmediate);
+    assert.deepEqual(started,[0,1,2,3],'The fifth transfer must never be dispatched');
+    assert.equal(progress.length,progressAtFailure,'Cancelled peers must not report late progress');
+  }
 });

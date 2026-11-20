@@ -8,16 +8,17 @@ function safeName(name) {
   return path.normalize(value).replace(/\/$/, '');
 }
 function decode(raw) { try { return new TextDecoder('utf-8', { fatal:true }).decode(raw); } catch { return Buffer.from(raw).toString('latin1'); } }
+const BINARY_RESOURCES = /\.(?:pdf|ps|eps|png|jpe?g|jp2|gif|webp|bmp|tiff?|ico|svgz?|heic|avif|woff2?|ttf|otf|eot|mp[34]|m[4k]v|mov|avi|webm|wav|flac|ogg|zip|gz|bz2|xz|7z|rar|tar|exe|dll|so|dylib|pyc)$/i;
 function sourceFiles(input) {
   let raw = Buffer.from(input);
   if (raw[0] === 31 && raw[1] === 139) raw = gunzipSync(raw, { maxOutputLength: MAX_SOURCE });
   if (raw.length > MAX_SOURCE) throw Error('源码包展开后过大');
   if (raw.subarray(0,5).toString() === '%PDF-') return new Map();
   const files = new Map(); let total = 0;
-  const add = (name, data) => { name = safeName(name); if (files.has(name)) throw Error('源码包文件名重复'); if (data.length > MAX_TEX || (total += data.length) > MAX_SOURCE) throw Error('源码文件过大'); files.set(name, decode(data)); };
+  const add = (name, data) => { name = safeName(name); if ((total += data.length) > MAX_SOURCE) throw Error('源码文件过大'); if (BINARY_RESOURCES.test(name)) return; if (files.has(name)) throw Error('源码包文件名重复'); if (data.length > MAX_TEX) throw Error('源码文件过大'); files.set(name, decode(data)); };
   if (raw.length >= 2 && raw.readUInt16LE(0) === 0x4b50) {
     let declaredTotal = 0;
-    const items = unzipSync(raw, { filter: item => { safeName(item.name); if ((declaredTotal += item.originalSize) > MAX_SOURCE || item.originalSize > MAX_TEX) throw Error('源码文件过大'); return !item.name.endsWith('/'); } });
+    const items = unzipSync(raw, { filter: item => { const name = safeName(item.name), retain = !item.name.endsWith('/') && !BINARY_RESOURCES.test(name); if ((declaredTotal += item.originalSize) > MAX_SOURCE || (retain && item.originalSize > MAX_TEX)) throw Error('源码文件过大'); return retain; } });
     for (const [name, data] of Object.entries(items)) add(name, data);
     return files;
   }

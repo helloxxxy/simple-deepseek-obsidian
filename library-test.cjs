@@ -8,6 +8,24 @@ const tex='\\documentclass{article}\n\\title{Title}\n\\begin{document}\n\\input{
 const bundle=()=>Buffer.from(zipSync({'main.tex':strToU8(tex),'part.tex':strToU8('BODY')}));
 async function fixture(fn){const root=await fs.mkdtemp(path.join(__dirname,'library-test-'));try{await fs.mkdir(path.join(root,'arxiv'));await fs.mkdir(path.join(root,'book','9780120831821'),{recursive:true});await fs.mkdir(path.join(root,'otherpaper'));await fs.writeFile(path.join(root,'book','9780120831821','Book.pdf'),'%PDF-fake');await fs.writeFile(path.join(root,'OVERVIEW.md'),baseOverview);await fn(root);}finally{const resolved=await fs.realpath(root);if(path.dirname(resolved)!==await fs.realpath(__dirname)||!path.basename(resolved).startsWith('library-test-'))throw Error('Unsafe fixture cleanup');await fs.rm(resolved,{recursive:true});}}
 const signal=()=>new AbortController().signal;
+test('an interrupted overview update restores the indexed version and preserves existing PDFs',async()=>fixture(async root=>{
+ const id='2101.12345';
+ const original=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});
+ const overview=path.join(root,'OVERVIEW.md');
+ const before=await fs.readFile(overview,'utf8'),tex=await fs.readFile(original.file,'utf8');
+ const pdf=path.join(original.folder,id+'v3.pdf');
+ await fs.writeFile(pdf,'%PDF-test');
+ const fetchVersion=async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v3')):fakeGet(id,Buffer.alloc(0))(url);
+ const rename=fs.rename;
+ try{
+  fs.rename=async(from,to)=>{if(to===overview)throw Error('overview write failed');return rename(from,to);};
+  await assert.rejects(lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fetchVersion}),/overview write failed/);
+ }finally{fs.rename=rename;}
+ assert.equal(await fs.readFile(original.file,'utf8'),tex);
+ assert.equal(await fs.readFile(pdf,'utf8'),'%PDF-test');
+ assert.equal(await fs.readFile(overview,'utf8'),before);
+ assert.equal((await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fetchVersion})).file,pdf);
+}));
 test('library dedup accepts Notebook, web, web-metadata and request-time context after a complete reference block',()=>{
  const body='Reference ID: 2601.XXXXX\nTitle: Paper\nSource: arxiv/2601.XXXXX/source.tex\nReference text:\n\nFULL TEXT';
  for(const suffix of ['\n\n[Notebook delta]\n{}','\n\n[Web reference sha256:'+'a'.repeat(64)+']\nURL: https://example.com\nTitle: Page\n\nWEB','\n\n[Web reference metadata]\n{"url":"https://example.com","retrieved_at":"2026-10-17T00:00:00.000Z"}',requestTimeContext({now:0,timeZone:'UTC'})])assert.equal(lib.deduplicateMentions('next',[body],[{role:'user',content:'first\n\n'+body+suffix}]),'next');
@@ -41,6 +59,24 @@ function tarFile(name,body,type='0'){body=Buffer.from(body);const h=Buffer.alloc
 test('source: tar gzip expansion and link rejection',()=>{
  const tar=Buffer.concat([tarFile('./main.tex',tex),tarFile('part.tex','BODY'),Buffer.alloc(1024)]);assert.match(source.flattenSource(gzipSync(tar)).text,/BODY/);assert.throws(()=>source.sourceFiles(Buffer.concat([tarFile('link','target','2'),Buffer.alloc(1024)])),/链接/);
 });
+test('source archives omit large binary resources while preserving TeX and extensionless inputs',()=>{
+ const main='\\documentclass{article}\n\\begin{document}\\input{part}\\input{custom.defs}\\end{document}',large=new Uint8Array(17*1024*1024);
+ const zip=zipSync({'main.tex':strToU8(main),'part':strToU8('EXTENSIONLESS TEXT'),'custom.defs':strToU8('CUSTOM TEXT'),'figures/plot.pdf':large,'fonts/font.otf':strToU8('binary font')});
+ const files=source.sourceFiles(zip);assert.deepEqual([...files.keys()].sort(),['custom.defs','main.tex','part']);const flattened=source.flattenSource(zip);assert.match(flattened.text,/EXTENSIONLESS TEXT/);assert.match(flattened.text,/CUSTOM TEXT/);assert.deepEqual(flattened.unresolved,[]);
+ const tar=Buffer.concat([tarFile('main.tex',main),tarFile('part','EXTENSIONLESS TEXT'),tarFile('custom.defs','CUSTOM TEXT'),tarFile('figures/plot.pdf',large),Buffer.alloc(1024)]);assert.match(source.flattenSource(tar).text,/EXTENSIONLESS TEXT/);assert.ok(!source.sourceFiles(tar).has('figures/plot.pdf'));
+});
+test('skipped source resources retain path, device and aggregate expansion protections',()=>{
+ assert.throws(()=>source.sourceFiles(zipSync({'../plot.pdf':strToU8('ignored')})),/不安全路径/);
+ assert.throws(()=>source.sourceFiles(Buffer.concat([tarFile('../plot.pdf','ignored'),Buffer.alloc(1024)])),/不安全路径/);
+ assert.throws(()=>source.sourceFiles(Buffer.concat([tarFile('plot.pdf','target','2'),Buffer.alloc(1024)])),/链接/);
+ const declaredSize=(name,size)=>{const zip=Buffer.from(zipSync({[name]:strToU8('small')})),central=zip.indexOf(Buffer.from([80,75,1,2]));assert.ok(central>=0);zip.writeUInt32LE(size,central+24);return zip;};
+ assert.throws(()=>source.sourceFiles(declaredSize('ignored.pdf',129*1024*1024)),/源码文件过大/);
+ assert.throws(()=>source.sourceFiles(declaredSize('main.tex',17*1024*1024)),/源码文件过大/);
+});
+test('arXiv import keeps usable source when its bundle also contains a large figure',async()=>fixture(async root=>{
+ const zip=Buffer.from(zipSync({'main.tex':strToU8('\\documentclass{article}\n\\begin{document}PAPER TEXT\\end{document}'),'figure.pdf':new Uint8Array(17*1024*1024)}));
+ const record=await lib.importArxiv(root,'2101.12345',signal(),()=>{},{Parser,get:fakeGet('2101.12345',zip),parseFile:()=>assert.fail('usable TeX must not fall back to MinerU')});assert.equal(path.basename(record.file),'source.tex');assert.match(await fs.readFile(record.file,'utf8'),/PAPER TEXT/);
+}));
 test('overview: chronological insert preserves every old byte and other sections',()=>{
  for(const id of ['cond-mat/9901001','2001.00000','2001.00002','2601.11111']){const info={id,title:'New title',authors:['New Author'],pdf:'New.pdf'};const updated=lib.insertOverview(baseOverview,info);const entries=lib.overviewEntries(updated).filter(e=>!e.id.startsWith('978'));assert.deepEqual(entries.map(e=>e.id),['2001.00001',id].sort((a,b)=>lib.sortKey(a).localeCompare(lib.sortKey(b))));assert.equal(updated.slice(updated.indexOf('### BOOK')),baseOverview.slice(baseOverview.indexOf('### BOOK')));assert.ok(updated.includes('[[notes#Old|notes]]'));assert.equal(lib.insertOverview(updated,info),updated);}
 });
@@ -50,10 +86,11 @@ test('metadata: verifies id and reads webpage title/authors and pinned download 
 test('import: source-only and overview commit; reimport is idempotent',async()=>fixture(async root=>{
  const id='2101.12345';const record=await lib.importArxiv(root,id,signal(),()=>{},{get:fakeGet(id),Parser});assert.equal(record.id,id);assert.equal(path.basename(record.file),'source.tex');assert.match(await fs.readFile(record.file,'utf8'),/BODY/);assert.match(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),/#### 2101.12345 \| A & B paper/);await lib.importArxiv(root,id+'v2',signal(),()=>{},{get:()=>assert.fail('no repeat network'),Parser});assert.ok(!(await fs.readdir(root)).includes('.simple-deepseek-library.lock'));
 }));
-test('import: unavailable source creates no PDF, folder or overview entry',async()=>fixture(async root=>{
- for(const src of [Buffer.from('%PDF-source'),Buffer.alloc(0),Buffer.from('no source')]){await assert.rejects(lib.importArxiv(root,'2101.12345',signal(),()=>{},{get:fakeGet('2101.12345',src),Parser}),/MinerU 密钥/);assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),baseOverview);}
- await assert.rejects(lib.importArxiv(root,'2101.12345',signal(),()=>{},{get:async url=>{if(url.includes('/abs/'))return Buffer.from(xml('2101.12345'));throw Error('HTTP 404');},Parser}),/MinerU 密钥/);
+test('import: unavailable source retains a PDF without a MinerU key',async()=>fixture(async root=>{
+ const record=await lib.importArxiv(root,'2101.12345',signal(),()=>{},{get:fakeGet('2101.12345',Buffer.alloc(0)),Parser});
+ assert.equal(path.basename(record.file),'2101.12345v2.pdf');assert.equal(await fs.readFile(record.file,'utf8'),'%PDF-test');assert.ok(record.indexed);
 }));
+
 test('import: failed source or cancellation leaves overview and library untouched',async()=>fixture(async root=>{
  const original=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');await assert.rejects(lib.importArxiv(root,'2101.12345',signal(),()=>{},{get:async url=>url.includes('/abs/')?Buffer.from(xml('2101.12345')):Buffer.from('not pdf'),Parser}));assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),original);assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);
  const controller=new AbortController();await assert.rejects(lib.importArxiv(root,'2101.12345',controller.signal,()=>{},{get:async url=>{if(url.includes('/abs/'))return Buffer.from(xml('2101.12345'));controller.abort();return Buffer.from('%PDF-test');},Parser}));assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);
@@ -64,12 +101,32 @@ test('import: concurrent overview edit is incorporated before sorted insert',asy
 test('citation: direct TeX read, alias search, no network or duplicate within one message',async()=>fixture(async root=>{
  const dir=path.join(root,'arxiv','2001.00001');await fs.mkdir(dir);await fs.writeFile(path.join(dir,'Old-2020-A.pdf'),'%PDF-test');await fs.writeFile(path.join(dir,'source.tex'),'RAW TEX');const records=await lib.scanLibrary(root);assert.equal(lib.searchRecords(records,'Old')[0].id,'2001.00001');const result=await lib.expandMentions('Compare @[2001.00001v2] @[2001.00001v2]',root,'',signal(),()=>{},()=>assert.fail('not PDF'));assert.equal(result.split('RAW TEX').length,2);assert.equal(lib.mentions('email@example.com').length,0);
 }));
+test('library metadata follows canonical IDs when different papers use the same PDF filename',async()=>fixture(async root=>{
+ const arxiv=path.join(root,'arxiv','2001.00001'),doi=path.join(root,'otherpaper','10.1234_paper-b');await fs.mkdir(arxiv);await fs.mkdir(doi);
+ await fs.writeFile(path.join(arxiv,'shared.pdf'),'%PDF-A');await fs.writeFile(path.join(doi,'shared.pdf'),'%PDF-B');
+ const overview=baseOverview.replace('Old-2020-A.pdf','shared.pdf')+'\n#### 10.1234/paper-b | Paper B\n\n> Author B\n> [[shared.pdf|pdf]]\n';await fs.writeFile(path.join(root,'OVERVIEW.md'),overview);
+ const records=await lib.scanLibrary(root),a=lib.findRecord(records,'2001.00001'),b=lib.findRecord(records,'10.1234/paper-b');
+ assert.equal(a.folder,arxiv);assert.equal(a.title,'Old');assert.equal(b.folder,doi);assert.equal(b.title,'Paper B');assert.ok(a.indexed&&b.indexed);
+ const paper=records.find(record=>record.id==='2001.00001');await lib.persistParsedPdf(root,paper,Buffer.from('%PDF-A'),'PARSED A',signal());
+ const updated=lib.overviewEntries(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'));assert.equal(updated.find(entry=>entry.id==='2001.00001').pdfHash,createHash('sha256').update('%PDF-A').digest('hex'));assert.equal(updated.find(entry=>entry.id==='10.1234/paper-b').pdfHash,null);
+}));
+test('library PDF links use relative paths before falling back to a unique short filename',async()=>fixture(async root=>{
+ const first=path.join(root,'otherpaper','local-a'),second=path.join(root,'otherpaper','local-b');await fs.mkdir(first);await fs.mkdir(second);await fs.writeFile(path.join(first,'shared.pdf'),'%PDF-A');await fs.writeFile(path.join(second,'shared.pdf'),'%PDF-B');
+ await fs.rename(path.join(root,'book','9780120831821'),path.join(root,'book','legacy-book'));
+ await fs.writeFile(path.join(root,'OVERVIEW.md'),baseOverview+'\n#### 10.1234/a | A\n> [[otherpaper/local-a/shared.pdf|pdf]]\n\n#### 10.1234/b | B\n> [[otherpaper\\local-b\\shared.pdf|pdf]]\n');
+ const records=await lib.scanLibrary(root);assert.equal(lib.findRecord(records,'10.1234/a').folder,first);assert.equal(lib.findRecord(records,'10.1234/b').folder,second);assert.equal(path.basename(lib.findRecord(records,'9780120831821').folder),'legacy-book');
+}));
+test('ambiguous short PDF links never assign metadata from an unrelated paper',async()=>fixture(async root=>{
+ for(const name of ['unknown-a','unknown-b']){const folder=path.join(root,'otherpaper',name);await fs.mkdir(folder);await fs.writeFile(path.join(folder,'shared.pdf'),'%PDF');}
+ await fs.writeFile(path.join(root,'OVERVIEW.md'),baseOverview+'\n#### 10.1234/a | A\n> [[shared.pdf|pdf]]\n\n#### 10.1234/b | B\n> [[shared.pdf|pdf]]\n');
+ const records=(await lib.scanLibrary(root)).filter(record=>record.category==='otherpaper');assert.deepEqual(records.map(record=>record.id).sort(),['unknown-a','unknown-b']);assert.ok(records.every(record=>!record.indexed));
+}));
 
 test('library reference ingestion filters wrapped image data before selection while source files stay unchanged',async()=>fixture(async root=>{
  const line='A'.repeat(76),payload='data:image/png;base64,'+Array(12).fill(line).concat('TQ==').join('\n  ');
  const body='# Keep this section\n\n$x^2$ and \\[y=2\\]\n![figure](figures/plot.png)\n\n'+payload+'\n\nKeep ordinary prose and print("ready").';
  const folder=path.join(root,'book','9780120831821'),markdown=path.join(folder,'markdown_Book.md');
- await fs.writeFile(markdown,body);
+ await fs.writeFile(markdown,body);const pdf=path.join(folder,'Book.pdf'),originalPdf=await fs.readFile(pdf);await fs.unlink(pdf);
  const selected=[],materials=[];
  const result=await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail('Markdown must not parse a PDF'),{materials,selectText:async text=>{selected.push(text);return text;}});
  for(const value of [selected.join('\n'),materials.join('\n'),result,JSON.stringify({session:{messages:[{role:'user',content:result}]}})]){assert.ok(!value.includes(line));assert.ok(!value.includes('TQ=='));assert.ok(!value.includes('data:image/'));assert.ok(value.includes('![figure](figures/plot.png)'));assert.ok(value.includes('$x^2$'));assert.ok(value.includes('Keep ordinary prose'));}
@@ -77,8 +134,8 @@ test('library reference ingestion filters wrapped image data before selection wh
  const texFolder=path.join(root,'arxiv','2001.00001');await fs.mkdir(texFolder);const texFile=path.join(texFolder,'source.tex');await fs.writeFile(texFile,body);
  const texResult=await lib.expandMentions('@[2001.00001v2]',root,'',signal(),()=>{},()=>assert.fail('TeX must not parse a PDF'),{selectText:async(text,_name,format)=>{assert.equal(format,'tex');assert.ok(!text.includes(line));return text;}});
  assert.ok(!texResult.includes(line));assert.equal(await fs.readFile(texFile,'utf8'),body);
- await fs.unlink(markdown);const pdf=path.join(folder,'Book.pdf'),originalPdf=await fs.readFile(pdf);
- const pdfResult=await lib.expandMentions('@[9780120831821]',root,'key',signal(),()=>{},async()=>body,{selectText:async text=>{assert.ok(!text.includes(line));return text;}});
+ await fs.unlink(markdown);await fs.writeFile(pdf,originalPdf);
+ const pdfResult=await lib.expandMentions('@[9780120831821]',root,'key',signal(),()=>{},()=>assert.fail('PDF bypasses MinerU'),{onFile:async(file,meta)=>{assert.equal(meta.id,'9780120831821');assert.deepEqual(Buffer.from(await file.arrayBuffer()),originalPdf);return 'file-api-book';},selectText:()=>assert.fail('PDF is sent as a file')});
  assert.ok(!pdfResult.includes(line));assert.deepEqual(await fs.readFile(pdf),originalPdf);
 }));
 
@@ -91,22 +148,23 @@ test('import: only source endpoint requested, tex indexed by id and cited withou
  const overview=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');const entry=overview.slice(overview.indexOf('#### '+id),overview.indexOf('### BOOK'));assert.ok(entry.includes('> [web](https://arxiv.org/abs/'+id+')'));assert.ok(!entry.includes('[['));assert.ok(!entry.includes('source.tex'));assert.ok(!overview.includes('undefined'));assert.ok(lib.searchRecords(await lib.scanLibrary(root),'Jane Doe').length);
  const result=await lib.expandMentions('@['+id+'v2]',root,'',signal(),()=>{},()=>assert.fail('No MinerU'));assert.match(result,/BODY/);
 }));
-test('citation: MinerU result is saved locally and reused while PDF hash matches',async()=>fixture(async root=>{
- const folder=path.join(root,'book','9780120831821'),pdf=path.join(folder,'Book.pdf'),md=path.join(folder,'markdown_Book.md');let parses=0;
- const result=await lib.expandMentions('@[9780120831821]',root,'fake',signal(),()=>{},async file=>{parses++;assert.equal(file.name,'Book.pdf');return 'PARSED PDF ONE';});assert.match(result,/PARSED PDF ONE/);assert.equal(await fs.readFile(md,'utf8'),'PARSED PDF ONE');
- const firstHash=createHash('sha256').update(Buffer.from('%PDF-fake')).digest('hex'),firstOverview=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');assert.ok(firstOverview.includes('<!-- pdf-sha256: '+firstHash+' -->'));assert.equal((firstOverview.match(/pdf-sha256:/g)||[]).length,1);
- const cached=await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail('matching PDF must use saved Markdown'));assert.match(cached,/PARSED PDF ONE/);assert.equal(parses,1);
- await fs.writeFile(pdf,'%PDF-changed');const changed=await lib.expandMentions('@[9780120831821]',root,'fake',signal(),()=>{},async()=>{parses++;return 'PARSED PDF TWO';});assert.match(changed,/PARSED PDF TWO/);assert.equal(await fs.readFile(md,'utf8'),'PARSED PDF TWO');assert.equal(parses,2);
- const secondHash=createHash('sha256').update(Buffer.from('%PDF-changed')).digest('hex'),secondOverview=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');assert.ok(secondOverview.includes('<!-- pdf-sha256: '+secondHash+' -->'));assert.ok(!secondOverview.includes(firstHash));assert.equal((secondOverview.match(/pdf-sha256:/g)||[]).length,1);
- await fs.writeFile(pdf,'%PDF-broken-update');await assert.rejects(lib.expandMentions('@[9780120831821]',root,'fake',signal(),()=>{},async()=>{throw Error('MinerU failed');}),/MinerU failed/);assert.equal(await fs.readFile(md,'utf8'),'PARSED PDF TWO');assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),secondOverview);
+test('citation: PDF takes precedence over cached Markdown and never calls MinerU',async()=>fixture(async root=>{
+ const folder=path.join(root,'book','9780120831821'),pdf=path.join(folder,'Book.pdf'),md=path.join(folder,'markdown_Book.md');
+ await fs.writeFile(md,'OLD EXTRACTION');let seen=[];const before=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');
+ const options={onFile:async(file,meta)=>{seen.push(meta.hash);assert.equal(file.name,'Book.pdf');return 'file-api-book';},selectText:()=>assert.fail('no text selection for native PDF')};
+ const first=await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail('no MinerU'),options);assert.match(first,/file-api-book/);assert.ok(!first.includes('OLD EXTRACTION'));
+ await fs.writeFile(pdf,'%PDF-changed');await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail('no MinerU'),options);assert.notEqual(seen[0],seen[1]);
+ assert.equal(await fs.readFile(md,'utf8'),'OLD EXTRACTION');assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),before);
+ await fs.writeFile(path.join(folder,'source.tex'),'SOURCE');const tex=await lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail(),{onFile:()=>assert.fail('TeX first')});assert.match(tex,/SOURCE/);
 }));
+
 test('arXiv import and library PDF conversion cannot write the overview concurrently',async()=>fixture(async root=>{
  const id='2101.12345',get=fakeGet(id);let release,entered;
  const gate=new Promise(resolve=>{release=resolve;}),started=new Promise(resolve=>{entered=resolve;});
  const importing=lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>{if(url.includes('/abs/')){entered();await gate;}return get(url);}});
  await started;
  try {
-  await assert.rejects(lib.expandMentions('@[9780120831821]',root,'mineru-key',signal(),()=>{},async()=> 'BOOK TEXT'),/文献库正在保存 PDF 解析结果/);
+  const record=(await lib.scanLibrary(root)).find(r=>r.id==='9780120831821');await assert.rejects(lib.persistParsedPdf(root,record,Buffer.from('%PDF-fake'),'BOOK TEXT',signal()),/文献库正在保存 PDF 解析结果/);
   assert.ok(!(await fs.readdir(path.join(root,'book','9780120831821'))).includes('markdown_Book.md'));
  } finally { release(); }
  await importing;
@@ -120,18 +178,21 @@ test('overview: inserting into empty section keeps separators before and after e
  const original='---\n\n### ARXIV\n\n---\n\n---\n\n### BOOK\n';const updated=lib.insertOverview(original,{id:'2101.12345',title:'New',authors:['A'],pdf:'A.pdf'});assert.ok(updated.indexOf('####')>updated.indexOf('---',updated.indexOf('### ARXIV')));assert.equal(updated.slice(updated.indexOf('### BOOK')),'### BOOK\n');
 });
 
-test('fallback: missing TeX converts PDF once, persists only md, later @ reads by id offline',async()=>fixture(async root=>{
- const id='2101.12345',urls=[];let parsed=0;const result=await lib.expandMentions('@['+id+']',root,'test-key',signal(),()=>{},async(file,key)=>{parsed++;assert.equal(key,'test-key');assert.equal(Buffer.from(await file.arrayBuffer()).toString(),'%PDF-test');return '# Paper\n\nEquation $x=1$';},{Parser,get:async url=>{urls.push(url);return fakeGet(id,Buffer.from('%PDF-source'))(url);}});
- assert.match(result,/# Paper/);assert.equal(parsed,1);assert.deepEqual(await fs.readdir(path.join(root,'arxiv',id)),['markdown_'+id+'.md']);assert.ok(urls.every(u=>!u.includes('/api/')));assert.equal(urls.filter(u=>u.includes('/pdf/')).length,1);
- const record=lib.findRecord(await lib.scanLibrary(root),id);assert.ok(record.indexed);assert.equal(record.title,'A & B paper');assert.equal(path.extname(record.file),'.md');const later=await lib.expandMentions('@['+id+'v2]',root,'',signal(),()=>{},()=>assert.fail('must read saved md'),{get:()=>assert.fail('must not fetch')});assert.match(later,/Equation/);
- const overview=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');const block=overview.slice(overview.indexOf('#### '+id),overview.indexOf('### BOOK'));assert.ok(!block.includes('[['));assert.ok(!block.includes('.pdf'));assert.ok(!block.includes('.md'));
+test('fallback: missing TeX retains PDF and later references work offline',async()=>fixture(async root=>{
+ const id='2101.12345',urls=[];let reads=0;const onFile=async file=>{reads++;assert.equal(Buffer.from(await file.arrayBuffer()).toString(),'%PDF-test');return 'file-api-paper';};
+ const result=await lib.expandMentions('@['+id+']',root,'',signal(),()=>{},()=>assert.fail('no MinerU'),{Parser,onFile,get:async url=>{urls.push(url);return fakeGet(id,Buffer.alloc(0))(url);}});
+ assert.match(result,/file-api-paper/);assert.equal(reads,1);assert.deepEqual(await fs.readdir(path.join(root,'arxiv',id)),[id+'v2.pdf']);assert.equal(urls.filter(u=>u.includes('/pdf/')).length,1);
+ const later=await lib.expandMentions('@['+id+']',root,'',signal(),()=>{},()=>assert.fail('no MinerU'),{Parser,onFile,get:async()=>{throw Error('ENOTFOUND');}});assert.match(later,/file-api-paper/);assert.equal(reads,2);
+ const overview=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');assert.ok(overview.includes('[['+id+'v2.pdf|pdf]]'));
 }));
+
 test('fallback: source 404 or absent source link uses PDF',async()=>fixture(async root=>{
- for(const [id,missing] of [['2101.12345',false],['2101.12346',true]]){const record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,mineruKey:'test',parseFile:async()=> 'PDF TEXT',get:async url=>{if(url.includes('/abs/'))return Buffer.from(missing?xml(id).replace(/<a href="\/src\/[^\"]+">TeX Source<\/a>/,''):xml(id));if(url.includes('/src/'))throw Error('HTTP 404');assert.ok(url.includes('/pdf/'));return Buffer.from('%PDF-test');}});assert.match(await fs.readFile(record.file,'utf8'),/PDF TEXT/);}
+ for(const [id,missing] of [['2101.12345',false],['2101.12346',true]]){const record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,mineruKey:'test',parseFile:async()=> 'PDF TEXT',get:async url=>{if(url.includes('/abs/'))return Buffer.from(missing?xml(id).replace(/<a href="\/src\/[^\"]+">TeX Source<\/a>/,''):xml(id));if(url.includes('/src/'))throw Error('HTTP 404');assert.ok(url.includes('/pdf/'));return Buffer.from('%PDF-test');}});assert.match(await fs.readFile(record.file,'utf8'),/%PDF-test/);}
 }));
-test('fallback: conversion error, empty output, invalid PDF and cancellation leave no artifacts',async()=>fixture(async root=>{
- const id='2101.12345';for(const mode of ['error','empty','pdf','cancel']){const controller=new AbortController();await assert.rejects(lib.importArxiv(root,id,controller.signal,()=>{},{Parser,mineruKey:'test',get:async url=>url.includes('/abs/')?Buffer.from(xml(id)):url.includes('/src/')?Buffer.alloc(0):Buffer.from(mode==='pdf'?'INVALID':'%PDF-test'),parseFile:async()=>{if(mode==='error')throw Error('MinerU failed');if(mode==='cancel')controller.abort();return mode==='empty'?'':'TEXT';}}));assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),baseOverview);assert.ok(!(await fs.readdir(root)).includes('.simple-deepseek-library.lock'));}
+test('fallback: invalid PDF and cancellation leave no artifacts',async()=>fixture(async root=>{
+ const id='2101.12345';for(const mode of ['pdf','cancel']){const controller=new AbortController();await assert.rejects(lib.importArxiv(root,id,controller.signal,()=>{},{Parser,get:async url=>{if(url.includes('/abs/'))return Buffer.from(xml(id));if(url.includes('/src/'))return Buffer.alloc(0);if(mode==='cancel')controller.abort();return Buffer.from(mode==='pdf'?'INVALID':'%PDF-test');}}));assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),baseOverview);assert.ok(!(await fs.readdir(root)).includes('.simple-deepseek-library.lock'));}
 }));
+
 test('fallback: source rate-limit is not treated as absent source',async()=>fixture(async root=>{
  await assert.rejects(lib.importArxiv(root,'2101.12345',signal(),()=>{},{Parser,mineruKey:'test',parseFile:()=>assert.fail('must not parse'),get:async url=>{if(url.includes('/abs/'))return Buffer.from(xml('2101.12345'));throw Error('HTTP 429');}}),/429/);assert.deepEqual(await fs.readdir(path.join(root,'arxiv')),[]);
 }));
@@ -143,14 +204,15 @@ test('refresh: unversioned @ replaces TeX and keeps PDF bytes and overview exact
  const id='2001.00001',folder=path.join(root,'arxiv',id);await fs.mkdir(folder);await fs.writeFile(path.join(folder,'source.tex'),'OLD TEX');await fs.writeFile(path.join(folder,'Old-2020-A.pdf'),'%PDF-KEEP');let fetched=0;
  const result=await lib.expandMentions('@['+id+']',root,'',signal(),()=>{},()=>assert.fail('TeX needs no MinerU'),{Parser,get:async url=>{fetched++;return fakeGet(id)(url);}});assert.equal(fetched,2);assert.match(result,/BODY/);assert.ok(!result.includes('OLD TEX'));assert.equal(await fs.readFile(path.join(folder,'Old-2020-A.pdf'),'utf8'),'%PDF-KEEP');assert.equal((await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8')).replace(/<!-- arxiv-version: [^\n]+ -->\n/,''),baseOverview);assert.deepEqual((await fs.readdir(folder)).sort(),['Old-2020-A.pdf','source.tex']);
 }));
-test('refresh: switching TeX to md and back keeps only current text and preserves PDF',async()=>fixture(async root=>{
+test('refresh: switching TeX to PDF and back keeps originals and selects the new version',async()=>fixture(async root=>{
  const id='2101.12345';let record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});await fs.writeFile(path.join(record.folder,'Keep.pdf'),'%PDF-KEEP');
- record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v3')):fakeGet(id,Buffer.alloc(0))(url),mineruKey:'test',parseFile:async()=> 'NEW MD'});assert.equal(path.extname(record.file),'.md');assert.deepEqual((await fs.readdir(record.folder)).sort(),['Keep.pdf','markdown_'+id+'.md']);
- record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v4')):bundle()});assert.equal(path.basename(record.file),'source.tex');assert.deepEqual((await fs.readdir(record.folder)).sort(),['Keep.pdf','source.tex']);assert.equal(await fs.readFile(path.join(record.folder,'Keep.pdf'),'utf8'),'%PDF-KEEP');
+ record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v3')):fakeGet(id,Buffer.alloc(0))(url)});assert.equal(path.basename(record.file),id+'v3.pdf');assert.deepEqual((await fs.readdir(record.folder)).sort(),[id+'v3.pdf','Keep.pdf']);
+ record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v4')):bundle()});assert.equal(path.basename(record.file),'source.tex');assert.deepEqual((await fs.readdir(record.folder)).sort(),[id+'v3.pdf','Keep.pdf','source.tex']);assert.equal(await fs.readFile(path.join(record.folder,'Keep.pdf'),'utf8'),'%PDF-KEEP');
 }));
-test('refresh: failed conversion leaves old text and PDF unchanged, explicit version is local',async()=>fixture(async root=>{
+
+test('refresh: failed PDF download leaves old text and PDF unchanged, explicit version is local',async()=>fixture(async root=>{
  const id='2101.12345';const record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});const old=await fs.readFile(record.file);await fs.writeFile(path.join(record.folder,'Keep.pdf'),'%PDF-KEEP');const before=await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8');
- await assert.rejects(lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>url.includes('/abs/')?Buffer.from(xml(id).replaceAll(id+'v2',id+'v3')):fakeGet(id,Buffer.alloc(0))(url),mineruKey:'test',parseFile:async()=>{throw Error('conversion failed');}}),/conversion failed/);assert.deepEqual(await fs.readFile(record.file),old);assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),before);assert.equal(await fs.readFile(path.join(record.folder,'Keep.pdf'),'utf8'),'%PDF-KEEP');
+ await assert.rejects(lib.importArxiv(root,id,signal(),()=>{},{Parser,get:async url=>{if(url.includes('/abs/'))return Buffer.from(xml(id).replaceAll(id+'v2',id+'v3'));if(url.includes('/src/'))return Buffer.alloc(0);throw Error('download failed');}}),/download failed/);assert.deepEqual(await fs.readFile(record.file),old);assert.equal(await fs.readFile(path.join(root,'OVERVIEW.md'),'utf8'),before);assert.equal(await fs.readFile(path.join(record.folder,'Keep.pdf'),'utf8'),'%PDF-KEEP');
  await lib.expandMentions('@['+id+'v2]',root,'',signal(),()=>{},()=>assert.fail('no parse'),{get:()=>assert.fail('explicit version uses local')});assert.ok(!(await fs.readdir(root)).includes('.simple-deepseek-library.lock'));
 }));
 
@@ -165,8 +227,43 @@ test('dedup: skips only exact reference blocks actually present in user context'
 });
 test('dedup: aliases of same local arxiv file attach once within one message',async()=>fixture(async root=>{
  const id='2101.12345';await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});const materials=[];
- const result=await lib.expandMentions('@['+id+'v2] @['+id+'v3]',root,'',signal(),()=>{},()=>assert.fail('no parse'),{materials});assert.equal(materials.length,1);assert.equal(result.split('BODY').length,2);
+ const result=await lib.expandMentions('@['+id+'v2] @[https://arxiv.org/pdf/'+id+'v2.pdf]',root,'',signal(),()=>{},()=>assert.fail('no parse'),{materials,get:()=>assert.fail('explicit version is local')});assert.equal(materials.length,1);assert.equal(result.split('BODY').length,2);
 }));
+
+test('explicit versions compare retained PDFs with current TeX and reject an absent version without changing the library', async()=>fixture(async root=>{
+ const id='2101.12345';
+ const record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});
+ const oldName=id+'v1.pdf', original=Buffer.from('%PDF older release');
+ await fs.writeFile(path.join(record.folder,oldName),original);
+ const overview=await fs.readFile(path.join(root,'OVERVIEW.md'));
+ const options={get:()=>assert.fail('local lookup must not download'),onFile:async(file,info)=>{
+  assert.equal(file.name,oldName);assert.equal(info.version,id+'v1');assert.deepEqual(Buffer.from(await file.arrayBuffer()),original);return file.name;
+ }};
+ const text=await lib.expandMentions('@['+id+'v2] @['+id+'v1]',root,'',signal(),()=>{},undefined,options);
+ assert.ok(text.includes('Reference ID: '+id+'v1'));assert.ok(text.includes('Reference ID: '+id+'v2'));assert.ok(text.includes('BODY'));assert.ok(text.includes(oldName));
+ await assert.rejects(lib.expandMentions('@['+id+'v2] @['+id+'v3]',root,'',signal(),()=>{},undefined,options),/本地没有所请求的 arXiv 版本/);
+ await assert.rejects(lib.importArxiv(root,id+'v3',signal(),()=>{},options),/本地没有所请求的 arXiv 版本/);
+ assert.equal(path.basename((await lib.importArxiv(root,id+'v1',signal(),()=>{},options)).file),oldName);
+ assert.deepEqual(await fs.readFile(path.join(root,'OVERVIEW.md')),overview);
+ assert.deepEqual(await fs.readFile(path.join(record.folder,oldName)),original);
+}));
+
+test('an explicitly versioned request to an unmarked library warns that its TeX version is unknown',async()=>fixture(async root=>{
+ const id='2001.00001',folder=path.join(root,'arxiv',id),warnings=[];
+ await fs.mkdir(folder);await fs.writeFile(path.join(folder,'source.tex'),'Unversioned source');
+ const result=await lib.expandMentions('@['+id+'v9]',root,'',signal(),()=>{},undefined,{get:()=>assert.fail('no download'),onWarning:value=>warnings.push(value)});
+ assert.match(result,/local version unverified/);assert.match(result,/Unversioned source/);assert.equal(warnings.length,1);assert.ok(warnings[0].endsWith(id+'v9'));
+}));
+
+test('explicit arXiv import resolves the requested page version even with navigation to a newer revision',()=>{
+ const id='2101.12345',requested=id+'v1';
+ const page=xml(id).replace('https://arxiv.org/pdf/'+id,'https://arxiv.org/pdf/'+requested);
+ const info=lib.metadata(page,requested,Parser);
+ assert.equal(info.resolved,requested);assert.equal(info.sourceUrl,'https://arxiv.org/src/'+requested);
+ assert.throws(()=>lib.metadata(page,id+'v2',Parser),/版本/);
+ const conflict=page.replace('citation_arxiv_id" content="'+id+'"','citation_arxiv_id" content="'+id+'v2"');
+ assert.throws(()=>lib.metadata(conflict,id,Parser),/版本/);
+});
 
 test('version comment: inserts and updates hidden marker while preserving all visible content',()=>{
  for(const eol of ['\n','\r\n']){const original=baseOverview.replace(/\n/g,eol);const first=lib.setOverviewVersion(original,'2001.00001','2001.00001v2');assert.ok(first.includes('<!-- arxiv-version: 2001.00001v2 -->'));assert.equal(first.replace(/<!-- arxiv-version: [^\r\n]* -->\r?\n/,''),original);const second=lib.setOverviewVersion(first,'2001.00001','2001.00001v3');assert.equal((second.match(/arxiv-version:/g)||[]).length,1);assert.equal(second.replace(/<!-- arxiv-version: [^\r\n]* -->\r?\n/,''),original);assert.equal(lib.setOverviewVersion(second,'2001.00001','2001.00001v3'),second);}
@@ -198,3 +295,20 @@ test('version reuse: no local copy or cancellation still fails',async()=>fixture
 test('range selection: @ uses selected body without modifying saved source',async()=>fixture(async root=>{
  const id='2101.12345';const record=await lib.importArxiv(root,id,signal(),()=>{},{Parser,get:fakeGet(id)});const original=await fs.readFile(record.file,'utf8');const materials=[];const result=await lib.expandMentions('@['+id+'v2]',root,'',signal(),()=>{},()=>assert.fail('not PDF'),{materials,selectText:async(body,name)=>{assert.equal(body,original);assert.ok(name.includes(id));return 'SELECTED TEXT';}});assert.match(result,/SELECTED TEXT/);assert.ok(!result.includes('documentclass'));assert.equal(materials.length,1);assert.equal(await fs.readFile(record.file,'utf8'),original);
 }));
+
+test('Markdown-only reference emits one nonblocking warning and keeps range selection',async()=>fixture(async root=>{
+ const folder=path.join(root,'book','9780120831821');await fs.unlink(path.join(folder,'Book.pdf'));await fs.writeFile(path.join(folder,'markdown_Book.md'),'BODY');const warnings=[];
+ const result=await lib.expandMentions('@[9780120831821] @[9780120831821]',root,'',signal(),()=>{},()=>assert.fail(),{onWarning:message=>warnings.push(message),selectText:async text=>text+' SELECTED'});assert.match(result,/BODY SELECTED/);assert.deepEqual(warnings,['该文献仅有 Markdown，建议补充 PDF 原件。']);
+}));
+
+test('ambiguous PDFs cannot silently fall back to Markdown',async()=>fixture(async root=>{
+ const folder=path.join(root,'book','9780120831821');await fs.rename(path.join(folder,'Book.pdf'),path.join(folder,'One.pdf'));await fs.writeFile(path.join(folder,'Two.pdf'),'%PDF-two');await fs.writeFile(path.join(folder,'markdown_Book.md'),'OLD TEXT');
+ const record=lib.findRecord(await lib.scanLibrary(root),'9780120831821');assert.equal(record.file,null);
+ await assert.rejects(lib.expandMentions('@[9780120831821]',root,'',signal(),()=>{},()=>assert.fail(),{onFile:()=>assert.fail()}),/可唯一确定/);
+}));
+
+test('native file content arrays retain exact text reference deduplication',()=>{
+ const material='Reference ID: paper\nTitle: Example\nSource: book/paper.pdf\nFile reference:\n\nfile-api-paper';
+ const messages=[{role:'user',content:[{type:'file',file_id:'file-api-paper'},{type:'text',text:'Question\n\n'+material}]}];
+ assert.equal(lib.deduplicateMentions('Again',[material],messages),'Again');
+});

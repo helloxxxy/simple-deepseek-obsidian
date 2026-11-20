@@ -1,28 +1,32 @@
 const { Plugin, ItemView, Notice, MarkdownRenderer, Component, setIcon, requestUrl } = require('obsidian');
 const { shell, clipboard } = require('electron');
 const { chat, listModels, parseFile, check, abortableTask } = require('./core');
+const {ACCEPT, acceptsChatFile, prepareFile, contentWithFiles, attachmentMetadata} = require('./chat-files');
+const {fileIds, validateFiles} = require('./deepseek-files');
+const {SpeechControls} = require('./speech');
 const { ImageStore } = require('./images');
 const { imageReference } = require('./image-context');
 const { stripImageDataUris } = require('./text-safety');
 const { ThinkingView } = require('./thinking-view');
 const { SourceList } = require('./source-list');
 const { NotebookPatchView } = require('./notebook-patch-view');
-const { ModelCatalog, assertReasoningEffort } = require('./models');
-const { validMessage, copyMessage, entryMessages, repairOpenTools, rebuildEntryMessages } = require('./history');
+const { MarkdownBlockCache, findTextRange } = require('./message-renderer');
+const { ModelCatalog, assertReasoningEffort, isFlashModel, assertFileModel } = require('./models');
+const { validMessage, copyMessage, sameMessage, entryMessages, repairOpenTools, rebuildEntryMessages } = require('./history');
 const { WebReferences, extractWebMentions, referenceMarker, hasOriginal, publicWebUrl } = require('./web');
-const { runToolTurn, turnTools, addUsage, TOOL_PROTOCOL_MESSAGES } = require('./tool-turn');
+const { runToolTurn, turnTools, toolSchemaMetadata, addUsage, TOOL_PROTOCOL_MESSAGES } = require('./tool-turn');
 const { buildSystemPrompt } = require('./prompts');
 const { TurnContext, notebookConnected } = require('./turn-context');
 const { requestTimeContext } = require('./request-context');
 const { normalizeMath } = require('./markdown');
 const { annotateMath, selectionInside, copySelection, backtickFence } = require('./selection-copy');
-const { estimateText, estimateMessages, contextTokens, rememberUsage, contextReserve, outputBudget, compactContext, formatUsage, recordCacheUsage, sessionStats } = require('./context');
+const { estimateText, estimateMessages, contextTokens, requestInputTokens, rememberUsage, contextReserve, outputBudget, compactContext, formatUsage, recordCacheUsage, sessionStats } = require('./context');
 const { TextPacer } = require('./pacing');
 const { createKeyStore } = require('./secrets');
-const { createConversationStore, validId: validConversationId } = require('./conversations');
+const { createConversationStore, prepareConversationRecord, validId: validConversationId } = require('./conversations');
 const { DEFAULT_LIBRARY, arxivId, scanLibrary, findRecord, searchRecords, expandMentions, deduplicateMentions } = require('./library');
 const { outline, headingAt, mergeRanges, withOutlineContext } = require('./outline');
-const { safeNotebook, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, notebookHash, parsePatch, describePatch, NotebookEditBuffer, requestUrlFetch, JupyterRtcClient } = require('./notebook');
+const { safeNotebook, notebookSnapshot, notebookDelta, notebookContext, notebookCurrentHash, notebookHash, figureFile, parsePatch, describePatch, NotebookEditBuffer, requestUrlFetch, JupyterRtcClient } = require('./notebook');
 const { rebaseNotebookPatch } = require('./notebook-merge');
 const { startLocalJupyter, stopLocalJupyter } = require('./jupyter-local');
 const { clipboardAttachments, materializeClipboardAttachment } = require('./clipboard');
@@ -54,6 +58,7 @@ function restoreSession(value) {
     if (Array.isArray(entry.modelMessages) && entry.modelMessages.every(validMessage)) restored.modelMessages = entry.modelMessages.map(copyMessage);
     if (Array.isArray(entry.failedRequests)) restored.failedRequests = entry.failedRequests;
     if (Array.isArray(entry.sources)) restored.sources = entry.sources.filter(source => source && typeof source.url === 'string' && typeof source.title === 'string');
+    if (Array.isArray(entry.files)) restored.files = entry.files.filter(file => file && typeof file.id === 'string' && typeof file.name === 'string').map(attachmentMetadata);
     if (Array.isArray(entry.images)) restored.images = entry.images.map(imageMetadata).filter(Boolean);
     if (entry.imageAnalysis && typeof entry.imageAnalysis.question === 'string') restored.imageAnalysis = {question:entry.imageAnalysis.question,model:'deepseek-flash',cached:!!entry.imageAnalysis.cached};
     if (entry.notebookPatch) { try { restored.notebookPatch = parsePatch(entry.notebookPatch); } catch {} }
@@ -67,8 +72,11 @@ function restoreSession(value) {
     if (Array.isArray(entry.protocolRecovery)) restored.protocolRecovery = entry.protocolRecovery.filter(event => event && typeof event.recovered === 'boolean' && Number.isSafeInteger(event.attempt));
     if (entry.requestCapabilities && typeof entry.requestCapabilities.webEnabled === 'boolean' && Array.isArray(entry.requestCapabilities.tools) && entry.requestCapabilities.tools.every(name => typeof name === 'string')) restored.requestCapabilities = {webEnabled:entry.requestCapabilities.webEnabled,tools:[...entry.requestCapabilities.tools]};
   });
+  if (Array.isArray(value.files)) session.files = value.files.filter(file => file && typeof file.id === 'string' && typeof file.name === 'string' && typeof file.hash === 'string').map(attachmentMetadata);
   const valid = n => Number.isFinite(n) && n >= 0;
   if (valid(value.meter?.tokens) && Number.isInteger(value.meter?.count) && value.meter.count >= 0 && value.meter.count <= session.messages.length) session.meter = { tokens: value.meter.tokens, count: value.meter.count, estimated: !!value.meter.estimated, ...(typeof value.meter.model === 'string' ? { model: value.meter.model } : {}), ...(typeof value.meter.systemPrompt === 'string' ? { systemPrompt: value.meter.systemPrompt } : {}), ...(typeof value.meter.includeReasoning === 'boolean' ? {includeReasoning:value.meter.includeReasoning} : {}) };
+  if (session.meter && Number.isSafeInteger(value.meter.schemaTokens) && value.meter.schemaTokens >= 0 && typeof value.meter.schemaHash === 'string' && (value.meter.schemaTokens === 0 ? value.meter.schemaHash === '' : /^[0-9a-f]{64}$/.test(value.meter.schemaHash))) Object.assign(session.meter,{schemaTokens:value.meter.schemaTokens,schemaHash:value.meter.schemaHash});
+  if (session.meter && value.meter.upperBound === true) session.meter.upperBound = true;
   if (valid(value.compactions)) session.compactions = value.compactions;
   if (value.cache && ['hit','miss','measured','unknown'].every(k => valid(value.cache[k]))) session.cache = Object.fromEntries(['hit','miss','measured','unknown'].map(k => [k, value.cache[k]]));
   if (value.notebookSnapshot && typeof value.notebookSnapshot.hash === 'string' && value.notebookSnapshot.cells && typeof value.notebookSnapshot.cells === 'object') session.notebookSnapshot = value.notebookSnapshot;
@@ -98,18 +106,6 @@ function sessionTitle(session) {
   const text = entry?.raw.trim().replace(/\s+/g, ' ') || '';
   return text ? (text.length > 36 ? text.slice(0, 36) + '…' : text) : '新对话';
 }
-function splitMarkdown(text, tokenLimit = 8000) {
-  if (estimateText(text) <= tokenLimit) return [text];
-  const lines = String(text).split(/(?<=\n)/), chunks = []; let current = '', inFence = false, inMath = false, ascii = 0, other = 0;
-  for (const line of lines) {
-    current += line;
-    for (const character of line) { if (character.charCodeAt(0) < 128) ascii++; else other++; }
-    if (/^\s*(?:`{3,}|~{3,})/.test(line)) inFence = !inFence;
-    if (!inFence && (line.match(/\$\$/g) || []).length % 2) inMath = !inMath;
-    if (!inFence && !inMath && /^\s*$/.test(line) && Math.ceil(ascii * 0.3 + other * 0.6) >= tokenLimit) { chunks.push(current); current = ''; ascii = 0; other = 0; }
-  }
-  if (current) chunks.push(current); return chunks.length ? chunks : [text];
-}
 const conversationId = () => `conversation-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;
 function messageMarkdown(entry, language = 'zh', includeSources = true, includeNotebookPatch = true) {
   let text = entry.toolProtocolError ? translate(TOOL_PROTOCOL_MESSAGES[entry.toolProtocolError], language) : entry.displayText ?? entry.raw;
@@ -125,7 +121,7 @@ function messageMarkdown(entry, language = 'zh', includeSources = true, includeN
   return text;
 }
 class ChatView extends ItemView {
-  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.session = plugin.session; this.messages = this.session.messages; this.notebookSnapshot = this.session.notebookSnapshot || null; this.controller = null; this.closed = false; this.rows = new Set(); this.images = new ImageStore(); this.pendingImages = []; this.notebookTaskBuffers = new Map(); }
+  constructor(leaf, plugin) { super(leaf); this.plugin = plugin; this.session = plugin.session; this.messages = this.session.messages; this.notebookSnapshot = this.session.notebookSnapshot || null; this.controller = null; this.closed = false; this.rows = new Set(); this.images = new ImageStore(); this.pendingImages = []; this.pendingFiles = []; this.notebookTaskBuffers = new Map(); }
   getViewType() { return VIEW; }
   getDisplayText() { return 'Simple DeepSeek'; }
   getIcon() { return 'message-circle'; }
@@ -164,6 +160,7 @@ class ChatView extends ItemView {
     this.refreshStats();
     this.refreshNotebookDeltaLabel();
     for (const row of this.rows) {
+      for (const button of row.body.querySelectorAll('.sd-code-copy')) this.labelCodeCopy(button);
       row.sourceList?.refresh();
       row.patchView?.refresh();
       if (row.entry.usage) row.usageEl.textContent = formatUsage(row.entry.usage, row.entry.durationMs, this.plugin.uiLanguage);
@@ -179,6 +176,7 @@ class ChatView extends ItemView {
       heading.textContent = translate(heading.dataset.sdSystemTitle, this.plugin.uiLanguage);
     }
     this.localizeTree(this.contentEl);
+    this.speech?.refresh();
   }
   async onOpen() {
     this.closed = false;
@@ -297,7 +295,7 @@ class ChatView extends ItemView {
     };
     this.feed.ownerDocument.addEventListener('copy', this.copySelectionListener, true);
     this.feed.ownerDocument.addEventListener('selectionchange', this.selectionChangeListener);
-    this.dropZone = feedShell.createDiv({ cls: 'sd-drop-zone', text: '松开以上传 PDF 或图片', attr: { 'aria-hidden': 'true' } }); this.dropZone.hidden = true;
+    this.dropZone = feedShell.createDiv({ cls: 'sd-drop-zone', text: '松开以添加附件', attr: { 'aria-hidden': 'true' } }); this.dropZone.hidden = true;
     const WindowIntersectionObserver = this.feed.ownerDocument.defaultView?.IntersectionObserver;
     this.virtualObserver = WindowIntersectionObserver ? new WindowIntersectionObserver(entries => {
       const viewport = entries.some(item => !item.isIntersecting) ? this.feed.getBoundingClientRect?.() : null;
@@ -341,9 +339,11 @@ class ChatView extends ItemView {
     });
     this.status = root.createDiv({ cls: 'sd-status', attr: { role: 'status', 'aria-live': 'polite' } });
     const composer = root.createDiv({ cls: 'sd-composer' });
-    this.pendingImageList = composer.createDiv({cls:'sd-pending-images',attr:{'aria-label':'待发送图片'}}); this.pendingImageList.hidden = true;
+    this.pendingImageList = composer.createDiv({cls:'sd-pending-images',attr:{'aria-label':'待发送附件'}}); this.pendingImageList.hidden = true;
     this.input = composer.createEl('textarea', { cls: 'sd-input', attr: { placeholder: '输入消息… Enter 发送，Shift+Enter 换行', 'aria-label': '消息', rows: '3' } });
     this.mentionPopup = composer.createDiv({ cls: 'sd-mentions', attr: { role: 'listbox', 'aria-label': '选择引用文献' } }); this.mentionPopup.hidden = true;
+    this.mentionPopup.id = 'sd-mentions-'+Date.now().toString(36)+'-'+Math.random().toString(36).slice(2,8);
+    this.input.setAttribute('aria-controls',this.mentionPopup.id); this.input.setAttribute('aria-autocomplete','list'); this.input.setAttribute('aria-expanded','false');
     this.input.addEventListener('input', () => { void this.updateMentions(); });
     this.input.addEventListener('paste', event => {
       const attachments = clipboardAttachments(event.clipboardData, clipboard);
@@ -357,22 +357,11 @@ class ChatView extends ItemView {
       if (event.key === 'Enter' && !event.shiftKey && !event.isComposing && event.keyCode !== 229) { event.preventDefault(); void this.send(); }
     });
     const actions = root.createDiv({ cls: 'sd-actions' });
-    const speedLine = actions.createEl('label', { cls: 'sd-speed' });
-    const speed = speedLine.createEl('input', { type: 'range', attr: { min: '20', max: '301', step: '1', 'aria-label': '本地显示速度：20 到 300 tokens/s，最右端不限速' } });
-    const speedValue = speedLine.createSpan({ cls: 'sd-speed-value' });
-    speed.value = String(this.plugin.displayTokensPerSecond === 0 ? 301 : this.plugin.displayTokensPerSecond);
-    const updateSpeed = () => {
-      const value = Number(speed.value);
-      this.plugin.displayTokensPerSecond = value === 301 ? 0 : value;
-      const label = value === 301 ? '不限速' : value + ' t/s';
-      speedValue.textContent = label; speed.setAttribute('aria-valuetext', label); speed.title = label;
-    };
-    updateSpeed();
-    speed.addEventListener('input', updateSpeed);
-    speed.addEventListener('change', () => { updateSpeed(); void this.plugin.saveKeys().catch(() => this.notice('显示速度保存失败')); });
-    this.file = root.createEl('input', { type: 'file', cls: 'sd-file', attr: { accept: '.pdf,.png,.jpg,.jpeg,.webp,.gif', multiple:'', 'aria-label': '选择附件' } });
+    this.speech = new SpeechControls(this);
+    this.speech.addDictationButton(actions,setIcon);
+    this.file = root.createEl('input', { type: 'file', cls: 'sd-file', attr: { accept: ACCEPT, multiple:'', 'aria-label': '选择附件' } });
     this.file.addEventListener('change', () => { const files = [...(this.file.files || [])]; this.file.value = ''; if (files.length) void this.uploadFiles(files); });
-    this.uploadButton = actions.createEl('button', { text: '上传 PDF / 图片' });
+    this.uploadButton = actions.createEl('button', { text: '添加附件' });
     this.uploadButton.addEventListener('click', () => this.file.click());
     this.sendButton = actions.createEl('button', { text: '发送', cls: 'mod-cta' });
     this.sendButton.addEventListener('click', () => { if (this.controller) this.controller.abort(); else void this.send(); });
@@ -388,7 +377,18 @@ class ChatView extends ItemView {
       });
       if (accepted && !this.closed) await this.clear();
     });
-    actions.append(speedLine);
+    const conversionFile = root.createEl('input',{type:'file',cls:'sd-file',attr:{accept:'.pdf,.png,.jpg,.jpeg,.webp,.gif,.bmp,.jp2',multiple:''}});
+    this.conversionButton = actions.createEl('button',{text:'文件转 Markdown',cls:'sd-convert'});
+    this.conversionButton.addEventListener('click',() => { if (!this.controller && !this.clearing) conversionFile.click(); });
+    conversionFile.addEventListener('change',() => {
+      const files = [...(conversionFile.files || [])]; conversionFile.value = '';
+      if (!files.length || this.controller || this.clearing) return;
+      void this.run(async signal => {
+        const key = this.plugin.keys.mineru;
+        if (!key) throw Error('请先填写 MinerU 密钥');
+        for (const file of files) { check(signal); await this.uploadPdf(file,key,signal); }
+      });
+    });
     const webLine = actions.createEl('label', {cls:'sd-web-toggle',attr:{title:'允许使用 Search / Fetch，下次发送生效'}});
     this.searchFetchToggle = webLine.createEl('input', {type:'checkbox',attr:{'aria-label':'启用 Search / Fetch'}}); this.searchFetchToggle.checked = this.plugin.webEnabled;
     webLine.createSpan({text:'Search / Fetch'});
@@ -423,7 +423,7 @@ class ChatView extends ItemView {
     this.conversationSelect.empty();
     const counts = new Map();
     for (const item of this.plugin.conversations) {
-      const title = this.plugin.conversationNames[item.id] || sessionTitle(item.session);
+      const title = this.plugin.conversationNames[item.id] || (item.session ? sessionTitle(item.session) : item.title) || '新对话';
       const displayTitle = title === '新对话' ? translate(title, this.plugin.uiLanguage) : title;
       const count = (counts.get(displayTitle) || 0) + 1; counts.set(displayTitle, count);
       const option = this.conversationSelect.createEl('option', { text: count > 1 ? `${displayTitle} · ${count}` : displayTitle }); option.value = item.id;
@@ -460,6 +460,10 @@ class ChatView extends ItemView {
     input.focus(); input.select();
   }
   async showConversation(id) {
+    const expectedFeed = this.feed, transition = this.conversationTransition;
+    try { await this.plugin.ensureConversation(id); }
+    catch { if (!this.closed) this.status.textContent = '对话读取失败，原文件已保留。'; this.refreshConversationOptions(); return; }
+    if (this.closed || this.feed !== expectedFeed || this.conversationTransition !== transition) return;
     if (!this.plugin.activateConversation(id)) { this.refreshConversationOptions(); return; }
     const feed = this.feed;
     this.resetImages();
@@ -502,6 +506,7 @@ class ChatView extends ItemView {
         if (!this.closed) {
           for (const [control,disabled] of controls) if (control.isConnected) control.disabled = disabled;
           for (const control of [this.runCellButton,this.runAllButton,this.resultButton]) control.disabled = !!this.notebookOperationToken;
+          for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = this.isBusy();
           this.refreshPatchActions();
           this.refreshConversationOptions(); this.refreshNotebookTaskStatus();
         }
@@ -520,11 +525,24 @@ class ChatView extends ItemView {
     const query = this.searchInput.value.trim().toLocaleLowerCase(); if (!query) return;
     this.pauseFollowing();
     const entries = this.session.entries, start = Number.isInteger(this.searchIndex) ? this.searchIndex + 1 : 0;
+    const states = new Map([...this.rows].map(state => [state.entry,state]));
     for (let offset = 0; offset < entries.length; offset++) {
       const index = (start + offset) % entries.length, entry = entries[index];
-      if (!`${entry.label}\n${entry.displayText ?? entry.raw}\n${entry.thinking || ''}`.toLocaleLowerCase().includes(query)) continue;
-      this.searchIndex = index; const state = [...this.rows].find(row => row.entry === entry); if (!state) return;
-      state.virtualVisible = true; void this.render(state); state.element.scrollIntoView({ block: 'center', behavior: 'smooth' }); state.element.classList.add('sd-search-hit'); this.searchHit = state.element; return;
+      const state = states.get(entry); if (!state || state.disposed) continue;
+      const visible = state.streaming ? state.raw : entry.displayText ?? entry.raw;
+      const thinking = state.streaming ? (entry.thinking || '').slice(0,state.thinkingShown ?? state.thinkingBody.textContent.length) : entry.thinking || '';
+      const inAnswer = `${entry.label}\n${visible}`.toLocaleLowerCase().includes(query), inThinking = thinking.toLocaleLowerCase().includes(query);
+      if (!inAnswer && !inThinking) continue;
+      this.searchIndex = index; state.virtualVisible = true; let target;
+      if (!inAnswer && inThinking) {
+        state.thinkingBox.open = true; state.thinkingView.setVisible(true); state.thinkingView.refresh();
+        target = findTextRange(state.thinkingBody,query);
+      }
+      void this.render(state);
+      const rect = target?.getBoundingClientRect?.(), viewport = rect && this.feed.getBoundingClientRect();
+      if (rect && Number.isFinite(rect.top) && rect.height > 0 && viewport?.height > 0) this.feed.scrollTop += rect.top-viewport.top-viewport.height/3;
+      else (target ? state.thinkingBody : state.element).scrollIntoView?.({block:'center',behavior:'smooth'});
+      state.element.classList.add('sd-search-hit'); this.searchHit = state.element; return;
     }
     this.status.textContent = '当前对话中没有匹配内容';
   }
@@ -562,7 +580,7 @@ class ChatView extends ItemView {
       this.reconcileNotebookSnapshot(); this.refreshNotebookDeltaLabel();
       this.stopNotebookChanges = client.onChange(value => {
         if (cancelled() || this.notebookClient !== client) return;
-        this.notebookLatest = value; this.scheduleNotebookPreview(value); this.refreshNotebookDeltaLabel(); this.setNotebookStatus('connected', this.controller && this.activeNotebookEdit && this.activeTurn?.notebookAvailable ? 'RTC 已连接 · 手动修改将在下一步同步给 AI' : 'RTC 已连接 · Notebook 有新变化');
+        this.notebookLatest = value; this.scheduleNotebookPreview(value); this.refreshNotebookDeltaLabel(value); this.setNotebookStatus('connected', this.controller && this.activeNotebookEdit && this.activeTurn?.notebookAvailable ? 'RTC 已连接 · 手动修改将在下一步同步给 AI' : 'RTC 已连接 · Notebook 有新变化');
       });
       this.notebookPreview.hidden = false; this.notebookPreview.open = false; this.renderNotebookPreview(notebook);
       this.notebookConnect.textContent = '断开'; this.notebookConnect.disabled = false; this.setNotebookStatus('connected');
@@ -698,20 +716,22 @@ class ChatView extends ItemView {
   reconcileNotebookSnapshot() {
     if (!this.notebookSnapshot) return;
     const known = new Set();
+    let lastFigureHash;
     for (const message of this.messages) {
       if (message.role !== 'user') continue;
-      const marker = message.content.lastIndexOf('[Notebook delta');
+      const content = Array.isArray(message.content) ? message.content.filter(block => block.type === 'text').map(block => block.text).join('\n') : message.content;
+      const marker = content.lastIndexOf('[Notebook delta');
       try {
-        if (marker >= 0) { const delta = JSON.parse(message.content.slice(marker).split('\n')[1]); if (delta.previousHash === null || known.has(delta.previousHash)) known.add(delta.currentHash); }
-        if (message.content.startsWith('[Notebook edits applied]\n')) { const receipt = JSON.parse(message.content.split('\n')[1]); if (known.has(receipt.baseHash)) known.add(receipt.currentHash); }
+        if (marker >= 0) { const delta = JSON.parse(content.slice(marker).split('\n')[1]); if (delta.previousHash === null || known.has(delta.previousHash)) { known.add(delta.currentHash); lastFigureHash=delta.figureHash; } }
+        if (typeof message.content === 'string' && message.content.startsWith('[Notebook edits applied]\n')) { const receipt = JSON.parse(message.content.split('\n')[1]); if (known.has(receipt.baseHash)) known.add(receipt.currentHash); }
       } catch {}
     }
-    if (!known.has(this.notebookSnapshot.hash)) this.resetNotebookDelta();
+    if (!known.has(this.notebookSnapshot.hash) || lastFigureHash !== this.notebookSnapshot.figureHash) this.resetNotebookDelta();
   }
-  refreshNotebookDeltaLabel() {
+  refreshNotebookDeltaLabel(snapshot = null) {
     if (!this.notebookAttachLabel) return;
     try {
-      const notebook = this.notebookClient.read();
+      const notebook = snapshot || this.notebookClient.read();
       const mode = this.notebookAttach.value;
       let count;
       if (mode === 'all') count = safeNotebook(notebook).cells.length;
@@ -909,7 +929,7 @@ class ChatView extends ItemView {
   }
   canApplyNotebookPatch(state) { return !this.isBusy() && !state.disposed && this.session.entries.includes(state.entry) && !state.entry.notebookApplied; }
   addPatchAction(state) {
-    if (this.closed || state.disposed || typeof parsePatch !== 'function' || state.patchButton || (state.streaming && !state.entry.notebookPatch) || state.entry.label === '你' || state.entry.notebookEvent) return;
+    if (this.closed || state.disposed || typeof parsePatch !== 'function' || state.patchButton || (state.streaming && !state.entry.notebookPatch) || state.entry.label === '你' || state.entry.notebookEvent || state.entry.label.startsWith('MinerU · ')) return;
     if (!state.entry.notebookApplied && (state.entry.notebookTaskInvalidated || this.session.notebookTasks?.[state.entry.notebookTaskId]?.invalidated)) { this.addNotebookRegenerateAction(state); return; }
     const index = this.session.entries.indexOf(state.entry);
     let fallbackHash = '';
@@ -937,7 +957,7 @@ class ChatView extends ItemView {
       const targetSession = operation.session;
       state.entry.replyId ||= `reply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`;
       this.applyingNotebookPatch = true;
-      const locked = [this.clearButton,this.conversationSelect,this.newConversationButton,this.renameConversationButton,this.sendButton,this.uploadButton,this.compressButton,this.notebookToggle,this.notebookAttach,this.notebookConnect].map(control => [control,control.disabled]);
+      const locked = [this.clearButton,this.conversationSelect,this.newConversationButton,this.renameConversationButton,this.sendButton,this.uploadButton,this.compressButton,this.notebookToggle,this.notebookAttach,this.notebookConnect,...this.feed.querySelectorAll('.sd-delete-turn')].map(control => [control,control.disabled]);
       for (const [control] of locked) control.disabled = true;
       try {
       const before = operation.client.read(); let prepared;
@@ -978,8 +998,8 @@ class ChatView extends ItemView {
   showNotebookPatchPreview(state) {
     if (!state.disposed && !this.closed) state.patchView?.refresh();
   }
-  row(label, text = '', entry = null, references = '', images = []) {
-    if (!entry) { entry = { label, raw: text, ...(references ? { references } : {}), ...(images.length ? {images:images.map(imageMetadata).filter(Boolean)} : {}) }; this.session.entries.push(entry); this.plugin.scheduleSessionSave(); }
+  row(label, text = '', entry = null, references = '', images = [], files = []) {
+    if (!entry) { entry = { label, raw: text, ...(references ? { references } : {}), ...(images.length ? {images:images.map(imageMetadata).filter(Boolean)} : {}), ...(files.length ? {files:files.map(file => ({...file}))} : {}) }; this.session.entries.push(entry); this.plugin.scheduleSessionSave(); }
     const row = this.feed.createDiv({ cls: 'sd-message' });
     const head = row.createDiv({ cls: 'sd-message-head' }); head.createSpan({ text: label });
     const copy = head.createEl('button', { cls: 'sd-icon-button', attr: { 'aria-label': '复制' + label, title: '复制 Markdown' } });
@@ -989,6 +1009,10 @@ class ChatView extends ItemView {
     const body = row.createDiv({ cls: 'sd-body' });
     const patchHost = row.createDiv({ cls: 'sd-notebook-patch-view' });
     const sourcesBox = row.createEl('details',{cls:'sd-sources'}), sourcesSummary = sourcesBox.createEl('summary'), sourcesBody = sourcesBox.createDiv({cls:'sd-sources-body'});
+    if (entry.files?.length) {
+      const files = row.createDiv({cls:'sd-image-references'});
+      for (const file of entry.files) if (!file.notebookFigure) files.createSpan({cls:'sd-image-name',text:file.name});
+    }
     if (entry.images?.length) {
       const attachments = row.createDiv({cls:'sd-image-references'});
       for (const image of entry.images) attachments.createSpan({cls:'sd-image-name',text:image.name});
@@ -997,13 +1021,34 @@ class ChatView extends ItemView {
     const footer = row.createDiv({ cls: 'sd-message-footer' });
     const copyBottom = footer.createEl('button', { cls: 'sd-icon-button', attr: { 'aria-label': '复制' + label, title: '复制 Markdown' } });
     for (const button of [copy, copyBottom]) setIcon(button, 'copy');
-    const index = this.session.entries.indexOf(entry);
-    if (index > 0 && this.session.entries[index - 1].label === '你' && label !== '你' && !label.startsWith('MinerU')) {
-      const trash = footer.createEl('button', { cls: 'sd-icon-button sd-delete-turn', attr: { 'aria-label': '删除本轮对话', title: '删除本轮对话并恢复输入' } });
-      setIcon(trash, 'trash-2'); trash.disabled = !!(this.controller || this.conversationTransition);
-      trash.addEventListener('click', () => { void this.deleteTurn(entry).catch(() => { this.status.textContent = '对话已在内存中删除，但存档保存失败'; }); });
+    if (label !== '你' && !entry.notebookEvent && !label.startsWith('MinerU')) this.speech?.addReadAloudButton(footer,() => entry.displayText ?? entry.raw,setIcon);
+    if (label.startsWith('MinerU · ')) {
+      const save = footer.createEl('button',{cls:'sd-icon-button',attr:{title:'保存 Markdown','aria-label':'保存 Markdown'}}); setIcon(save,'download');
+      save.addEventListener('click',() => {
+        const win = row.ownerDocument.defaultView, url = win.URL.createObjectURL(new win.Blob([entry.raw],{type:'text/markdown;charset=utf-8'}));
+        const link = row.createEl('a',{attr:{href:url,download:label.slice(9).replace(/\.[^.]+$/,'')+'.md'}});
+        link.click(); link.remove(); win.setTimeout(() => win.URL.revokeObjectURL(url),1000);
+      });
     }
-    const state = { element: row, entry, thinkingBox, thinkingBody, sourcesBox, body, usageEl, raw: '', version: 0, rendered: -1, timer: null, running: null, component: null, inflight: null, disposed: false };
+    const index = this.session.entries.indexOf(entry);
+    const conversion = label.startsWith('MinerU · ');
+    if (conversion || (index > 0 && this.session.entries[index - 1].label === '你' && label !== '你' && !label.startsWith('MinerU'))) {
+      const trash = footer.createEl('button', { cls: 'sd-icon-button sd-delete-turn', attr: { 'aria-label': conversion ? '删除转换结果' : '删除本轮对话', title: conversion ? '删除转换结果' : '删除本轮对话并恢复输入' } });
+      setIcon(trash, 'trash-2'); trash.disabled = this.isBusy();
+      trash.addEventListener('click', () => {
+        const deletion = conversion ? this.deleteConversion(entry, state) : this.deleteTurn(entry);
+        void deletion.catch(() => { this.status.textContent = '对话已在内存中删除，但存档保存失败'; });
+      });
+    }
+    const state = { element: row, entry, thinkingBox, thinkingBody, sourcesBox, body, usageEl, raw: '', version: 0, rendered: -1, timer: null, running: null, component: null, disposed: false };
+    state.markdownCache = new MarkdownBlockCache({document:body.ownerDocument,
+      render:async (text,host,component) => {
+        await MarkdownRenderer.render(this.app,text,host,'',component);
+        this.addCodeCopyControls(host);
+      },
+      createComponent:() => { const component = new Component(); this.addChild(component); return component; },
+      disposeComponent:component => this.removeChild(component)
+    });
     state.thinkingView = new ThinkingView({details:thinkingBox,body:thinkingBody,getText:() => state.entry.thinking || '',feed:this.feed,
       onBeforeRender:follow => !!follow && this.canFollow(state),
       onAfterRender:follow => { if (follow && !state.disposed && !this.closed && thinkingBox.open) this.scroll(); }
@@ -1013,7 +1058,10 @@ class ChatView extends ItemView {
     state.thinkingView.setVisible(!this.virtualObserver); state.sourceList.setVisible(!this.virtualObserver);
     row.__sdState = state; state.virtualVisible = !this.virtualObserver; this.virtualObserver?.observe(row);
     this.rows.add(state);
-    for (const button of [copy, copyBottom]) button.addEventListener('click', () => { void navigator.clipboard.writeText(normalizeMath(messageMarkdown(state.entry,this.plugin.uiLanguage))).catch(() => this.notice('无法访问剪贴板，请手动选择文本复制')); });
+    for (const button of [copy, copyBottom]) button.addEventListener('click', () => {
+      const markdown = label.startsWith('MinerU · ') ? state.entry.raw : normalizeMath(messageMarkdown(state.entry,this.plugin.uiLanguage));
+      void navigator.clipboard.writeText(markdown).catch(() => this.notice('无法访问剪贴板，请手动选择文本复制'));
+    });
     this.update(state, text); if (entry.notebookPatch) this.addPatchAction(state); this.localizeTree(row); this.scroll(); return state;
   }
   async selectTextRange(text, name, signal, format = 'md') {
@@ -1059,6 +1107,31 @@ class ChatView extends ItemView {
       signal.addEventListener('abort',abort,{once:true});if(signal.aborted){abort();return;}update();(tocMode?checks[0]?.box:start)?.focus();
     });
   }
+  async deleteConversion(entry, state) {
+    if (this.isBusy() || state.disposed) return;
+    const entries = this.session.entries, index = entries.indexOf(entry);
+    if (index < 0 || !entry.label.startsWith('MinerU · ')) return;
+    const contribution = entryMessages(entry);
+    if (contribution.length) {
+      // Older conversions could add extracted text to a later compression checkpoint.
+      const suffix = entries.slice(index).flatMap(entryMessages);
+      const offset = this.messages.length - suffix.length;
+      if (offset >= 0 && suffix.every((message,i) => sameMessage(this.messages[offset + i],message))) {
+        this.messages.splice(offset,contribution.length);
+      } else {
+        const retained = rebuildEntryMessages(entries.filter(item => item !== entry));
+        this.messages.splice(0,this.messages.length,...retained); this.session.compactions = 0;
+      }
+      this.session.meter = null; this.reconcileNotebookSnapshot(); this.refreshNotebookDeltaLabel();
+    }
+    entries.splice(index,1);
+    if (this.searchHit === state.element) this.searchHit = null;
+    if (this.replyAnchor?.state === state) this.replyAnchor = null;
+    this.disposeRow(state); this.rows.delete(state); state.element.remove();
+    this.refreshConversationOptions(); this.refreshStats(); this.restoreComposerFocus(null,true);
+    this.status.textContent = '转换结果已删除。';
+    await this.plugin.saveSession(this.session);
+  }
   async deleteTurn(entry) {
     if (this.isBusy()) return;
     const index = this.session.entries.indexOf(entry), user = this.session.entries[index - 1];
@@ -1067,7 +1140,9 @@ class ChatView extends ItemView {
     const asMessages = entryMessages;
     const suffix = this.session.entries.slice(index - 1).flatMap(asMessages);
     const offset = this.messages.length - suffix.length;
-    const direct = offset >= 0 && suffix.every((m, i) => JSON.stringify(copyMessage(this.messages[offset + i])) === JSON.stringify(copyMessage(m)));
+    const removedFiles = new Set((user.files || []).map(file => file.id));
+    const filesStillReferenced = this.session.entries.some(item => item !== user && item.files?.some(file => removedFiles.has(file.id)));
+    const direct = !filesStillReferenced && offset >= 0 && suffix.every((m, i) => JSON.stringify(copyMessage(this.messages[offset + i])) === JSON.stringify(copyMessage(m)));
     const retainedSuffix = this.session.entries.slice(index - 1).filter(item => item !== user && item !== entry && !(entry.replyId && item.sourceReplyId === entry.replyId));
     const invalidatedTaskIds = new Set(entry.notebookTaskId && retainedSuffix.some(item => item.notebookTaskId === entry.notebookTaskId) ? [entry.notebookTaskId] : []);
     this.session.entries.splice(index - 1,this.session.entries.length-index+1,...retainedSuffix);
@@ -1081,11 +1156,15 @@ class ChatView extends ItemView {
     this.hideMentions(); const draft = this.input.value;
     this.input.value = user.raw + (draft.trim() ? '\n\n' + draft : ''); this.restoreComposerFocus(null, true); this.input.setSelectionRange(0, user.raw.length);
     for (const image of user.images || []) if (this.images.get(image.id) && !this.pendingImages.some(value => value.id === image.id)) { this.pendingImages.push(image); this.images.setPinned([image.id],true); }
+    for (const file of user.files || []) if (!file.notebookFigure && !this.pendingFiles.some(item => item.remote?.id === file.id)) this.pendingFiles.push({name:file.name,remote:file});
     this.refreshPendingImages();
     this.refreshConversationOptions(); this.refreshStats(); this.refreshNotebookTaskStatus(); this.status.textContent = compressed && !direct ? '已删除本轮；原压缩摘要已移除，上下文由剩余对话重建。' : '已删除本轮，原提问已放回输入框。';
     await this.plugin.saveSession();
   }
-  hideMentions() { this.mentionTicket = (this.mentionTicket || 0) + 1; if (this.mentionPopup) this.mentionPopup.hidden = true; }
+  hideMentions() {
+    this.mentionTicket = (this.mentionTicket || 0) + 1; if (this.mentionPopup) this.mentionPopup.hidden = true;
+    this.input?.setAttribute('aria-expanded','false'); this.input?.removeAttribute('aria-activedescendant');
+  }
   mentionAtCursor() {
     const range = this.mentionRange;
     return range && this.input.selectionStart === range.end && this.input.selectionEnd === range.end && this.input.value.slice(0,range.end) === range.prefix;
@@ -1111,13 +1190,15 @@ class ChatView extends ItemView {
       this.mentionItems = searchRecords(this.libraryRecords, query);
       try { const id = arxivId(query); if (!findRecord(this.libraryRecords, id)) this.mentionItems.unshift({ id, title: ARXIV_IMPORT_HINT, authors: '', systemHint: true }); } catch {}
       this.mentionPopup.empty(); this.mentionPopup.hidden = false; this.mentionIndex = 0;
+      this.input.setAttribute('aria-expanded','true'); this.input.removeAttribute('aria-activedescendant');
       if (!this.mentionItems.length) this.mentionPopup.createDiv({ text: '未找到文献；可输入完整 arXiv 编号入库', cls: 'sd-hint' });
       for (const [i, item] of this.mentionItems.entries()) {
-        const button = this.mentionPopup.createEl('button', { attr: { role: 'option', 'aria-selected': String(i === 0) } });
+        const button = this.mentionPopup.createEl('button', { attr: { id:this.mentionPopup.id+'-option-'+i,role: 'option', 'aria-selected': String(i === 0) } });
+        if (i === 0) this.input.setAttribute('aria-activedescendant',button.id);
         button.createSpan({ text: item.id, cls: 'sd-mention-id' }); button.createSpan({ text: item.systemHint ? translate(item.title, this.plugin.uiLanguage) : item.title, cls: 'sd-mention-title' });
         button.addEventListener('mousedown', event => event.preventDefault()); button.addEventListener('click', () => this.selectMention(i));
       }
-    } catch (error) { if (ticket === this.mentionTicket && !this.closed) { if (!this.mentionAtCursor()) { this.hideMentions(); return; } this.mentionItems = []; this.mentionPopup.empty(); this.mentionPopup.createDiv({ cls: 'sd-hint', text: '无法读取文献库，请检查顶部路径设置。' }); this.mentionPopup.hidden = false; } }
+    } catch (error) { if (ticket === this.mentionTicket && !this.closed) { if (!this.mentionAtCursor()) { this.hideMentions(); return; } this.mentionItems = []; this.mentionPopup.empty(); this.mentionPopup.createDiv({ cls: 'sd-hint', text: '无法读取文献库，请检查顶部路径设置。' }); this.mentionPopup.hidden = false; this.input.setAttribute('aria-expanded','true'); this.input.removeAttribute('aria-activedescendant'); } }
   }
   selectMention(index) {
     if (!this.mentionAtCursor()) { this.hideMentions(); return; }
@@ -1132,7 +1213,10 @@ class ChatView extends ItemView {
     if (event.key === 'Escape') { event.preventDefault(); this.hideMentions(); return true; }
     if (['ArrowUp','ArrowDown'].includes(event.key) && this.mentionItems?.length) {
       event.preventDefault(); this.mentionIndex = (this.mentionIndex + (event.key === 'ArrowDown' ? 1 : -1) + this.mentionItems.length) % this.mentionItems.length;
-      [...this.mentionPopup.querySelectorAll('button')].forEach((button,i) => button.setAttribute('aria-selected',String(i===this.mentionIndex))); return true;
+      [...this.mentionPopup.querySelectorAll('button')].forEach((button,i) => {
+        button.setAttribute('aria-selected',String(i===this.mentionIndex));
+        if (i === this.mentionIndex) { this.input.setAttribute('aria-activedescendant',button.id); button.scrollIntoView?.({block:'nearest'}); }
+      }); return true;
     }
     if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') { if (this.mentionItems?.length) { event.preventDefault(); this.selectMention(this.mentionIndex); return true; } }
     return false;
@@ -1175,12 +1259,18 @@ class ChatView extends ItemView {
   }
   requestMetadata() {
     const capabilities = this.currentCapabilities();
-    return {model:this.plugin.model,systemPrompt:buildSystemPrompt(capabilities),includeReasoning:capabilities.webEnabled || capabilities.imagesEnabled || capabilities.notebookEnabled};
+    const nativeWeb = isFlashModel(this.plugin.model) && !capabilities.notebookEnabled && !capabilities.imagesEnabled;
+    return {model:this.plugin.model,systemPrompt:buildSystemPrompt({...capabilities,nativeWeb}),includeReasoning:capabilities.webEnabled || capabilities.imagesEnabled || capabilities.notebookEnabled};
   }
   requestPrompt() { return this.requestMetadata().systemPrompt; }
   refreshPendingImages() {
     if (!this.pendingImageList || this.closed) return;
-    this.pendingImageList.empty(); this.pendingImageList.hidden = !this.pendingImages.length;
+    this.pendingImageList.empty(); this.pendingImageList.hidden = !this.pendingImages.length && !this.pendingFiles.length;
+    for (const file of this.pendingFiles) {
+      const item = this.pendingImageList.createDiv({cls:'sd-pending-image'}); item.createSpan({cls:'sd-image-name',text:file.name});
+      const remove = item.createEl('button',{cls:'sd-icon-button',attr:{title:'移除附件','aria-label':'移除附件'}}); setIcon(remove,'x'); remove.disabled = !!this.controller;
+      remove.addEventListener('click',() => { if (this.controller) return; this.pendingFiles = this.pendingFiles.filter(value => value !== file); this.refreshPendingImages(); });
+    }
     for (const image of this.pendingImages) {
       const item = this.pendingImageList.createDiv({cls:'sd-pending-image'});
       item.createSpan({cls:'sd-image-name',text:image.name});
@@ -1194,7 +1284,7 @@ class ChatView extends ItemView {
       });
     }
   }
-  resetImages() { this.images.clear(); this.pendingImages = []; this.refreshPendingImages(); }
+  resetImages() { this.speech?.reset(); this.images.clear(); this.pendingImages = []; this.pendingFiles = []; this.refreshPendingImages(); }
   async visionOptions(key, signal, reasoningEffort, imageIds = [], question = '') {
     const capabilities = await this.plugin.modelCatalog.get(key,'deepseek-flash',signal); check(signal);
     assertReasoningEffort(capabilities,reasoningEffort);
@@ -1245,12 +1335,35 @@ class ChatView extends ItemView {
     }
     if (this.canFollow(state) && (!state.lastScrollSet || now - state.lastScrollSet >= 50)) { this.scroll(); state.lastScrollSet = now; }
   }
+  labelCodeCopy(button) {
+    button.title = translate('复制文本块',this.plugin.uiLanguage);
+    button.setAttribute('aria-label',button.title);
+  }
+  addCodeCopyControls(host) {
+    for (const code of host.querySelectorAll('pre > code')) {
+      const pre = code.parentElement;
+      const wrapper = host.ownerDocument.createElement('div'); wrapper.className = 'sd-code-block';
+      pre.before(wrapper); wrapper.append(pre);
+      const addButton = before => {
+        const button = host.ownerDocument.createElement('button');
+        button.type = 'button'; button.className = 'sd-icon-button sd-code-copy';
+        this.labelCodeCopy(button); setIcon(button,'copy');
+        button.addEventListener('click',() => {
+          void navigator.clipboard.writeText(code.textContent).catch(() => this.notice('无法访问剪贴板，请手动选择文本复制'));
+        });
+        wrapper.insertBefore(button,before);
+      };
+      if (!pre.querySelector('button.copy-code-button')) addButton(pre);
+      addButton(null);
+    }
+  }
   attachTail(stage, tail, raw) {
     // Stay inside the final text block, never inside a link, emphasis or MathJax tree.
     let host = stage, node = stage.lastElementChild;
     const boundary = /\n[ \t]*\n$/.test(raw);
     if (!boundary) {
       while (node) {
+        if (node.classList.contains('sd-code-block') && node.querySelector(':scope > pre')) node = node.querySelector(':scope > pre');
         if (node.matches('.math, .math-block, mjx-container, table, hr')) break;
         if (node.matches('p, h1, h2, h3, h4, h5, h6, td, th')) { host = node; break; }
         if (node.matches('pre')) {
@@ -1282,21 +1395,15 @@ class ChatView extends ItemView {
     const expressions = [];
     const markdown = normalizeMath(displayText, expression => expressions.push(expression));
     const stage = state.body.ownerDocument.createElement('div'); stage.className = 'markdown-rendered sd-markdown';
-    const component = new Component(); this.addChild(component); state.inflight = component;
     state.running = (async () => {
-      try {
-        const chunks = splitMarkdown(markdown);
-        if (chunks.length === 1) await MarkdownRenderer.render(this.app, markdown, stage, '', component);
-        else for (const chunk of chunks) { const part = stage.ownerDocument.createElement('div'); part.className = 'sd-markdown-chunk'; stage.append(part); await MarkdownRenderer.render(this.app, chunk, part, '', component); }
-        annotateMath(stage, expressions);
-      } catch {
-        stage.replaceChildren(); stage.classList.add('sd-render-fallback'); stage.textContent = markdown;
-      }
-      if (state.disposed || this.closed || (!state.streaming && version !== state.version)) { this.removeChild(component); return; }
-      if (selectionInside(state.body)) { this.selectionDeferredRows.add(state); this.removeChild(component); return; }
+      const plan = await state.markdownCache.prepare(markdown,() => !state.disposed && !this.closed && (state.streaming || version === state.version) && (!this.virtualObserver || state.virtualVisible || state.streaming));
+      if (!plan) return;
+      if (state.disposed || this.closed || (!state.streaming && version !== state.version)) { state.markdownCache.discard(plan); return; }
+      if (selectionInside(state.body)) { this.selectionDeferredRows.add(state); state.markdownCache.discard(plan); return; }
       const nearBottom = this.canFollow(state);
-      if (state.component) this.removeChild(state.component);
-      state.component = component;
+      if (!state.markdownCache.commit(plan,stage)) return;
+      annotateMath(stage, expressions);
+      state.component = state.markdownCache.component;
       if (state.streaming) {
         state.committed = raw.length;
         state.tailText.data = state.raw.slice(raw.length);
@@ -1309,7 +1416,10 @@ class ChatView extends ItemView {
       if (nearBottom) this.scroll(); this.scheduleStatsRefresh();
     })();
     try { await state.running; }
-    finally { state.running = null; state.inflight = null; }
+    finally {
+      state.running = null;
+      if (this.virtualObserver && !state.virtualVisible && !state.streaming) this.virtualize(state);
+    }
     if (!state.disposed && !this.closed && state.rendered !== state.version) {
       if (state.streaming) {
         if (!state.timer) state.timer = setTimeout(() => { state.timer = null; void this.render(state); }, STREAM_MARKDOWN_MS);
@@ -1317,25 +1427,25 @@ class ChatView extends ItemView {
     }
   }
   disposeRows() {
+    this.speech?.discardReplyControls();
     this.replyAnchor = null;
     this.searchHit = null;
     this.followingReply = null; this.followPaused = true;
-    for (const state of this.rows) {
-      this.selectionDeferredRows?.delete(state);
-      this.thinkingCollapseDeferredRows?.delete(state);
-      this.virtualObserver?.unobserve(state.element);
-      state.disposed = true; state.raw = ''; clearTimeout(state.timer);
-      state.thinkingView?.dispose(); state.sourceList?.dispose(); state.patchView?.dispose();
-      if (state.component) this.removeChild(state.component);
-      if (state.inflight) this.removeChild(state.inflight);
-    }
+    for (const state of this.rows) this.disposeRow(state);
     this.rows.clear();
+  }
+  disposeRow(state) {
+    this.selectionDeferredRows?.delete(state); this.thinkingCollapseDeferredRows?.delete(state);
+    this.virtualObserver?.unobserve(state.element);
+    state.disposed = true; state.raw = ''; clearTimeout(state.timer);
+    state.thinkingView?.dispose(); state.sourceList?.dispose(); state.patchView?.dispose();
+    state.markdownCache?.clear(); state.component = null;
   }
   virtualize(state) {
     if (state.streaming || state.running || state.disposed || !state.component) return;
     if (selectionInside(state.body)) { this.selectionDeferredRows.add(state); return; }
     const height = Math.max(24, Math.ceil(state.body.getBoundingClientRect?.().height || state.body.scrollHeight || 0));
-    state.body.style.minHeight = height + 'px'; state.body.replaceChildren(); this.removeChild(state.component); state.component = null; state.rendered = -1;
+    state.body.style.minHeight = height + 'px'; state.body.replaceChildren(); state.markdownCache.clear(); state.component = null; state.rendered = -1;
   }
   async run(work) {
     if (this.isBusy()) return;
@@ -1347,7 +1457,7 @@ class ChatView extends ItemView {
     const targetSession = this.session; this.refreshPendingImages(); this.refreshNotebookTaskStatus();
     for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = true;
     for (const button of this.feed.querySelectorAll('.sd-notebook-apply')) button.disabled = true;
-    this.sendButton.textContent = '停止'; this.sendButton.title = '停止当前操作'; this.uploadButton.disabled = true; this.compressButton.disabled = true; this.effortSelect.disabled = true;
+    this.sendButton.textContent = '停止'; this.sendButton.title = '停止当前操作'; this.uploadButton.disabled = true; this.conversionButton.disabled = true; this.compressButton.disabled = true; this.effortSelect.disabled = true;
     this.conversationSelect.disabled = true; this.newConversationButton.disabled = true; this.renameConversationButton.disabled = true; this.notebookAttach.disabled = true;
     try { await work(controller.signal); }
     catch (error) {
@@ -1365,17 +1475,17 @@ class ChatView extends ItemView {
         for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = false;
         this.refreshPatchActions();
         if (!this.closed) {
-          this.refreshStats(); this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.conversationSelect.disabled = false; this.newConversationButton.disabled = false; this.renameConversationButton.disabled = false; this.notebookAttach.disabled = false;
+          this.refreshStats(); this.sendButton.textContent = '发送'; this.sendButton.title = ''; this.sendButton.disabled = false; this.uploadButton.disabled = false; this.conversionButton.disabled = false; this.compressButton.disabled = false; this.effortSelect.disabled = false; this.conversationSelect.disabled = false; this.newConversationButton.disabled = false; this.renameConversationButton.disabled = false; this.notebookAttach.disabled = false;
           this.refreshPendingImages(); this.refreshNotebookTaskStatus(); this.activeNotebookEdit = null;
           if (restoreComposerFocus) this.restoreComposerFocus(origin);
         }
       }
     }
   }
-  async compress(key, signal, extra = 0, model = this.plugin.model, force = false, capabilities = null, reasoningEffort = this.plugin.reasoningEffort, systemPrompt = this.requestPrompt(), includeReasoning = this.requestMetadata().includeReasoning) {
+  async compress(key, signal, extra = 0, model = this.plugin.model, force = false, capabilities = null, reasoningEffort = this.plugin.reasoningEffort, systemPrompt = this.requestPrompt(), includeReasoning = this.requestMetadata().includeReasoning, requestSchema = {schemaTokens:0,schemaHash:''}) {
     const limits = capabilities || await this.plugin.modelCatalog.get(key, model, signal); check(signal);
     assertReasoningEffort(limits, reasoningEffort);
-    const result = await compactContext(this.session, key, signal, text => { if (!signal.aborted && !this.closed) this.status.textContent = text; }, (...args) => { args[5] = { ...args[5], model, reasoningEffort }; return chat(...args); }, extra, force, systemPrompt, limits, model, includeReasoning);
+    const result = await compactContext(this.session, key, signal, text => { if (!signal.aborted && !this.closed) this.status.textContent = text; }, (...args) => { args[5] = { ...args[5], model, reasoningEffort }; return chat(...args); }, extra, force, systemPrompt, limits, model, includeReasoning, requestSchema);
     check(signal); this.refreshStats();
     if (result) { this.resetNotebookDelta(); await this.plugin.saveSession(); }
     return result;
@@ -1384,12 +1494,16 @@ class ChatView extends ItemView {
     if (this.controller || this.clearing || this.closed) return;
     if (!this.messages.length) { this.status.textContent = '暂无可压缩的上下文'; return; }
     if (!this.plugin.keys.deepseek) { this.status.textContent = '请先填写 DeepSeek 密钥'; return; }
-    await this.run(async signal => { await this.compress(this.plugin.keys.deepseek, signal, 0, this.plugin.model, true); check(signal); this.status.textContent = ''; });
+    await this.run(async signal => {
+      const model = this.plugin.model;
+      if (fileIds(this.messages).length) assertFileModel(model);
+      await this.compress(this.plugin.keys.deepseek, signal, 0, model, true); check(signal); this.status.textContent = '';
+    });
   }
   async send() {
     const submittedDraft = this.input.value;
     const text = submittedDraft.trim();
-    if ((!text && !this.pendingImages.length) || this.controller || this.clearing || this.closed || this.conversationTransition) return;
+    if ((!text && !this.pendingImages.length && !this.pendingFiles.length) || this.controller || this.clearing || this.closed || this.conversationTransition) return;
     if (!this.plugin.keys.deepseek) { this.status.textContent = '请先填写 DeepSeek 密钥'; return; }
     const key = this.plugin.keys.deepseek; const model = this.plugin.model;
     const libraryPath = this.plugin.libraryPath, mineruKey = this.plugin.keys.mineru;
@@ -1399,13 +1513,15 @@ class ChatView extends ItemView {
     const {webEnabled,imagesEnabled,notebookSendMode} = turn;
     const resumeTaskId = this.resumeNotebookTaskId || null;
     const attachments = this.pendingImages.map(image => ({...image}));
+    const pendingFiles = [...this.pendingFiles];
     const imageQuestion = text || 'Describe the attached images.';
-    const userText = text || attachments.map(image => image.name).join('\n');
+    const userText = text || [...attachments,...pendingFiles].map(file => file.name).join('\n');
     const requestContext = requestTimeContext();
     const targetSession = turn.session;
     await this.run(async signal => {
       this.activeTurn = turn;
       this.hideMentions();
+      if (pendingFiles.length || fileIds(targetSession.messages).length) assertFileModel(model);
       const capabilities = await this.plugin.modelCatalog.get(key, model, signal); check(signal);
       assertReasoningEffort(capabilities, reasoningEffort);
       let initialImageUsage = null, initialImageResult = null, initialImageDurationMs = 0;
@@ -1427,6 +1543,20 @@ class ChatView extends ItemView {
         const result = await this.images.describe(args.imageIds,args.question,{...options,region:args.region,onUsage}); check(signal);
         return {kind:'image_description',images:result.images,question:args.question,...(args.region ? {region:args.region} : {}),description:result.text,cached:result.cached};
       }} : null;
+      const nativeWeb = isFlashModel(model) && !turn.notebookAvailable && !imageTools;
+      const files = [];
+      const attachFile = async file => {
+        assertFileModel(model);
+        this.status.textContent = '正在上传附件…';
+        const record = file.remote || await prepareFile(file,targetSession,key,signal); check(signal);
+        if (!files.some(value => value.id === record.id)) files.push(record);
+        return `File: ${record.name}`;
+      };
+      for (const file of pendingFiles.filter(file => !file.remote)) await attachFile(file);
+      for (const file of pendingFiles.filter(file => file.remote)) {
+        const current = targetSession.files?.find(item => item.hash === file.remote.hash) || file.remote;
+        await attachFile({remote:current});
+      }
       const available = capabilities.contextWindow - contextReserve(capabilities);
       const webMaterials = [], sources = [];
       const addSource = source => { if (source && typeof source.url === 'string' && !sources.some(item => item.url === source.url)) sources.push({url:source.url,title:source.title || source.url}); };
@@ -1437,18 +1567,54 @@ class ChatView extends ItemView {
       });
       const urls = webEnabled ? extractWebMentions(text).filter(url => { try { arxivId(url); return false; } catch { return true; } }) : [];
       const webUrlSet = new Set(urls);
-      for (const url of urls) { const result = JSON.parse(await web.execute('fetch_page',{url})); addSource(result); check(signal); }
+      for (const url of nativeWeb ? [] : urls) { const result = JSON.parse(await web.execute('fetch_page',{url})); addSource(result); check(signal); }
       const libraryText = text.replace(/@\[(https?:\/\/(?:\[[^\]\r\n]+\]|[^\]\r\n])*)\]/gi,(match,url) => { if (webEnabled) return webUrlSet.has(publicWebUrl(url)) ? url : match; try { arxivId(url); return match; } catch { return url; } });
       const materials = [];
-      const fullExpanded = text ? await expandMentions(libraryText, libraryPath, mineruKey, signal, value => { if (!signal.aborted && !this.closed) this.status.textContent = value; }, parseFile, { materials, selectText: (body, name, format) => this.selectTextRange(body, name, signal, format) }) : userText; check(signal); this.libraryRecords = null;
-      let notebookExtra = '', sentNotebookSnapshot = null, notebookForEdits = null;
+      const fullExpanded = text ? await expandMentions(libraryText, libraryPath, mineruKey, signal, value => { if (!signal.aborted && !this.closed) this.status.textContent = value; }, parseFile, { materials, onFile:attachFile, onWarning:value => this.notice(value), selectText: (body, name, format) => this.selectTextRange(body, name, signal, format) }) : userText; check(signal); this.libraryRecords = null;
+      const recoveredFiles = new Set();
+      for (;;) {
+        try {
+          await validateFiles([...this.messages,{role:'user',content:files.map(file => ({type:'file',file_id:file.id}))}],key,signal);
+          break;
+        } catch (error) {
+          const expired = targetSession.files?.find(file => file.id === error.fileId);
+          if (error.code !== 'FILE_UNAVAILABLE' || !expired || recoveredFiles.has(expired.id)) throw error;
+          const live = turn.readNotebook();
+          if (!live) throw error;
+          const {changed} = notebookDelta(live,null);
+          const cell = changed.find(cell => cell.figures?.some(image => image.digest === expired.hash));
+          if (!cell) throw error;
+          const image = cell.figures.find(image => image.digest === expired.hash);
+          recoveredFiles.add(expired.id);
+          const restored = await prepareFile(figureFile(live,cell.index,image),targetSession,key,signal);
+          if (!turn.notebookAvailable) throw error;
+          for (let i=0;i<files.length;i++) if (files[i].id===expired.id) files[i]=restored;
+        }
+      }
+      check(signal);
+      let notebookExtra = '', sentNotebookSnapshot = null, notebookForEdits = null, submittedDelta = null;
+      const preparedFigures = new Map();
+      const prepareFigures = async (notebook,delta) => {
+        const records = new Map();
+        for (const cell of delta?.changed || []) for (const figure of cell.figures || []) {
+          if (!turn.notebookAvailable) return [];
+          assertFileModel(model);
+          if (!preparedFigures.has(figure.digest)) {
+            const file = figureFile(notebook,cell.index,figure);
+            const record = await prepareFile(file,targetSession,key,signal); check(signal);
+            preparedFigures.set(figure.digest,{...record,notebookFigure:true});
+          }
+          records.set(figure.digest,preparedFigures.get(figure.digest));
+        }
+        return turn.notebookAvailable ? [...records.values()] : [];
+      };
       const refreshNotebookExtra = () => {
         if (notebookSendMode === 'none') return;
         notebookForEdits = turn.readNotebook();
-        if (!notebookForEdits) { notebookExtra = ''; sentNotebookSnapshot = null; return; }
+        if (!notebookForEdits) { notebookExtra = ''; sentNotebookSnapshot = null; submittedDelta = null; return; }
         this.reconcileNotebookSnapshot();
         const delta = notebookDelta(notebookForEdits, notebookSendMode === 'all' ? null : this.notebookSnapshot);
-        notebookExtra = notebookContext(delta); sentNotebookSnapshot = delta.snapshot;
+        notebookExtra = notebookContext(delta); sentNotebookSnapshot = delta.snapshot; submittedDelta = delta;
       };
       refreshNotebookExtra();
       const notebookIdentity = turn.notebookIdentity;
@@ -1460,8 +1626,8 @@ class ChatView extends ItemView {
       const metadata = {model};
       const updateRequestMetadata = () => {
         includeReasoning = turn.includeReasoning;
-        systemPrompt = buildSystemPrompt({webEnabled,imagesEnabled,notebookMode:turn.notebookMode,notebookEnabled:!!editBuffer && turn.notebookAvailable});
-        Object.assign(metadata,{systemPrompt,includeReasoning});
+        systemPrompt = buildSystemPrompt({nativeWeb,webEnabled,imagesEnabled,notebookMode:turn.notebookMode,notebookEnabled:!!editBuffer && turn.notebookAvailable});
+        Object.assign(metadata,{systemPrompt,includeReasoning},toolSchemaMetadata(turnTools(turn.notebookAvailable ? editBuffer : null,webEnabled,imageTools,undefined,nativeWeb)));
         this.activeRequestMetadata = metadata;
       };
       updateRequestMetadata();
@@ -1478,30 +1644,37 @@ class ChatView extends ItemView {
       let expanded = compose();
       const extra = estimateMessages([{role:'user',content:expanded}]);
       if (extra >= available) throw Error('单次输入超过上下文可用空间，请缩小引用或选择更短范围');
-      await this.compress(key, signal, extra, model, false, capabilities, reasoningEffort, systemPrompt, includeReasoning); check(signal); refreshNotebookExtra();
+      await this.compress(key, signal, extra + metadata.schemaTokens, model, false, capabilities, reasoningEffort, systemPrompt, includeReasoning, metadata); check(signal); refreshNotebookExtra(); updateRequestMetadata();
       expanded = compose();
-      if (estimateMessages([{role:'user',content:expanded}]) > extra) { await this.compress(key, signal, estimateMessages([{role:'user',content:expanded}]), model, false, capabilities, reasoningEffort, systemPrompt, includeReasoning); check(signal); refreshNotebookExtra(); expanded = compose(); }
-      if (contextTokens(this.session, metadata) + estimateMessages([{role:'user',content:expanded}]) >= available) throw Error('本轮输入和现有上下文仍超过可用空间，请缩小引用或选择更短范围');
-      let observedLiveSnapshot = notebookForEdits ? notebookSnapshot(notebookForEdits) : null;
+      if (estimateMessages([{role:'user',content:expanded}]) > extra) { await this.compress(key, signal, estimateMessages([{role:'user',content:expanded}]) + metadata.schemaTokens, model, false, capabilities, reasoningEffort, systemPrompt, includeReasoning, metadata); check(signal); refreshNotebookExtra(); updateRequestMetadata(); expanded = compose(); }
+      if (requestInputTokens(this.session,estimateMessages([{role:'user',content:expanded}]) + metadata.schemaTokens,metadata) >= available) throw Error('本轮输入和现有上下文仍超过可用空间，请缩小引用或选择更短范围');
+      const figureFiles = await prepareFigures(notebookForEdits,submittedDelta); check(signal);
+      if (submittedDelta && !turn.notebookAvailable) { refreshNotebookExtra(); expanded = compose(); }
+      const submittedFiles = [...files,...figureFiles];
+      let observedLiveSnapshot = sentNotebookSnapshot;
       updateRequestMetadata();
-      const tools = turnTools(turn.notebookAvailable ? editBuffer : null,webEnabled,imageTools), schemaTokens = tools.length ? estimateText(JSON.stringify(tools)) + 16 : 0;
+      const tools = turnTools(turn.notebookAvailable ? editBuffer : null,webEnabled,imageTools,undefined,nativeWeb), schema = toolSchemaMetadata(tools), schemaTokens = schema.schemaTokens;
+      Object.assign(metadata,schema);
       outputBudget(this.session,estimateMessages([{role:'user',content:expanded}])+schemaTokens,capabilities,metadata);
       if (this.input.value === submittedDraft) this.input.value = '';
       const submittedNotebookContext = notebookExtra + editTaskContext();
-      this.resumeNotebookTaskId = null; const question = this.row('你', userText, null, text && fullExpanded !== libraryText ? fullExpanded.slice(libraryText.length).trim() : '',attachments); question.entry.contextText = fullExpanded + webText() + composeImages(false) + submittedNotebookContext + requestContext; if (notebookExtra) question.entry.notebookAttached = true;
+      this.resumeNotebookTaskId = null; const question = this.row('你', userText, null, text && fullExpanded !== libraryText ? fullExpanded.slice(libraryText.length).trim() : '',attachments,files); question.entry.contextText = fullExpanded + webText() + composeImages(false) + submittedNotebookContext + requestContext; if (notebookExtra) question.entry.notebookAttached = true;
       if (initialImageResult) question.entry.imageAnalysis = {question:imageQuestion,model:'deepseek-flash',cached:initialImageResult.cached};
+      question.entry.files = submittedFiles.map(attachmentMetadata);
+      this.pendingFiles = this.pendingFiles.filter(file => !pendingFiles.includes(file));
       this.pendingImages = this.pendingImages.filter(image => !attachments.some(sent => sent.id === image.id)); this.images.setPinned(attachments.map(image => image.id),false); this.refreshPendingImages(); this.refreshConversationOptions();
       const output = this.row(model); let answer = '';
       output.entry.replyId = `reply-${Date.now().toString(36)}-${Math.random().toString(36).slice(2,10)}`; output.entry.modelMessages = [];
-      output.entry.requestCapabilities = {webEnabled,tools:tools.map(tool => tool.function.name)};
+      output.entry.requestCapabilities = {webEnabled,tools:tools.map(tool => tool.function?.name || tool.type)};
       if (editBuffer) output.entry.notebookTaskIdentity = notebookIdentity;
       this.activeNotebookEdit = editBuffer;
       this.status.textContent = '正在思考…';
-      const user = { role: 'user', content: expanded };
+      const user = { role: 'user', content: contentWithFiles(expanded,submittedFiles,this.messages) };
+      if (submittedFiles.length) question.entry.modelMessages = [copyMessage(user)];
       this.messages.push(user); this.refreshStats();
       clearTimeout(output.timer); output.timer = null; output.streaming = true;
       this.startFollowing(output);
-      const pacer = new TextPacer({ incremental: true, frameMs: 32, getRate: () => this.plugin.displayTokensPerSecond, signal, onFrame: async chunk => {
+      const pacer = new TextPacer({ incremental: true, frameMs: 32, getRate: () => 0, signal, onFrame: async chunk => {
         if (signal.aborted || this.closed || output.disposed) return;
         this.revealDelta(output, chunk);
       }});
@@ -1509,11 +1682,10 @@ class ChatView extends ItemView {
       output.thinkingView.setShown(0);
       const syncThinkingShown = () => {
         if (signal.aborted || this.closed || output.disposed) return;
-        const direct = this.plugin.displayTokensPerSecond === 0 || !output.thinkingBox.open || answerStarted || output.thinkingPlaybackFailed;
-        output.thinkingShown = Math.max(output.thinkingShown || 0,direct ? (output.entry.thinking || '').length : thinkingPacer.shown);
+        output.thinkingShown = (output.entry.thinking || '').length;
         output.thinkingView.setShown(output.thinkingShown);
       };
-      const thinkingPacer = new TextPacer({ incremental: true, frameMs: 48, getRate: () => output.thinkingBox.open ? this.plugin.displayTokensPerSecond : 0, signal, onFrame: () => {
+      const thinkingPacer = new TextPacer({ incremental: true, frameMs: 48, getRate: () => 0, signal, onFrame: () => {
         syncThinkingShown();
       }});
       const thinkingDisplay = thinkingPacer.run().then(() => null, error => {
@@ -1530,18 +1702,25 @@ class ChatView extends ItemView {
       };
       try {
         const requestStarted = Date.now()-initialImageDurationMs;
-        const result = await runToolTurn({key,session:targetSession,signal,model,reasoningEffort,systemPrompt,capabilities,web:webEnabled ? web : null,webEnabled,notebook:editBuffer,notebookAvailable:() => turn.notebookAvailable,images:imageTools,userText,send:chat,
-          beforeRequest:async extra => {
+        const result = await runToolTurn({key,session:targetSession,signal,model,reasoningEffort,systemPrompt,capabilities,nativeWeb,web:webEnabled ? web : null,webEnabled,notebook:editBuffer,notebookAvailable:() => turn.notebookAvailable,images:imageTools,userText,send:chat,
+          beforeRequest:async (extra,requestSchema) => {
+            const notebookWasAvailable = turn.notebookAvailable;
             if (editBuffer) {
               const latest = turn.readNotebook(), delta = latest ? notebookDelta(latest,observedLiveSnapshot) : null;
               if (delta && (delta.changed.length || delta.removed.length)) {
                 const update = {role:'user',content:notebookContext(delta)+'\n\n[Notebook changed during generation]\nThe user changed the live Notebook. Preserve those changes. The edit task is still based on its original snapshot; use the task currentHash, not this live hash, for staging. Reconciliation is required before applying. Task: '+JSON.stringify(editBuffer.status())};
-                targetSession.messages.push(update); output.entry.modelMessages.push(update); targetSession.meter = null; this.plugin.scheduleSessionSave(targetSession);
-                observedLiveSnapshot = delta.snapshot; sentNotebookSnapshot = delta.snapshot;
+                  const figures = await prepareFigures(latest,delta); check(signal);
+                  if (turn.notebookAvailable) {
+                    update.content = contentWithFiles(update.content,figures,[]);
+                    targetSession.messages.push(update); output.entry.modelMessages.push(update); targetSession.meter = null; this.plugin.scheduleSessionSave(targetSession);
+                    observedLiveSnapshot = delta.snapshot; sentNotebookSnapshot = delta.snapshot;
+                  }
               }
             }
             notifyNotebookUnavailable();
-            await this.compress(key,signal,extra,model,false,capabilities,reasoningEffort,systemPrompt,turn.includeReasoning); check(signal);
+            updateRequestMetadata();
+            const currentSchema = requestSchema && notebookWasAvailable === turn.notebookAvailable ? requestSchema : toolSchemaMetadata(turnTools(turn.notebookAvailable ? editBuffer : null,webEnabled,imageTools,undefined,nativeWeb));
+            await this.compress(key,signal,currentSchema.schemaTokens,model,false,capabilities,reasoningEffort,systemPrompt,turn.includeReasoning,currentSchema); check(signal);
             notifyNotebookUnavailable();
           },
           onCheckpoint:async state => {
@@ -1555,6 +1734,14 @@ class ChatView extends ItemView {
               else if (targetSession.activeNotebookTaskId === editBuffer.taskId) delete targetSession.activeNotebookTaskId;
             } else if (!signal.aborted && !this.closed) this.status.textContent = '源码含图片或二进制数据，暂存任务仅在本次运行中可恢复';
             await this.plugin.saveSession(targetSession,true);
+          },
+          onAnnotations:annotations => { for (const annotation of annotations) addSource(annotation.url_citation || annotation); if (sources.length) { output.entry.sources = [...sources]; output.sourceList.refresh(); } },
+          onServerToolEvent:event => {
+            if (signal.aborted || this.closed || output.disposed) return;
+            responsePhase = 'status'; this.status.textContent = '正在检索网页…';
+            for (const source of event.call?.sources || []) addSource(source);
+            addSource(event.call?.page);
+            if (sources.length) { output.entry.sources = [...sources]; output.sourceList.refresh(); this.plugin.scheduleSessionSave(targetSession); }
           },
           onStatus:value => { if (!signal.aborted && !this.closed) { responsePhase = 'status'; this.status.textContent = value; } },
           onToolProgress:progress => {
@@ -1576,14 +1763,21 @@ class ChatView extends ItemView {
           onRecord:record => {
             if (record.error || record.unfinishedToolCalls?.length || record.rejectedToolCalls?.length) (output.entry.failedRequests ||= []).push(record);
             if (record.type === 'tool_result') { try { const data = JSON.parse(record.message.content); for (const source of data.results || [data]) addSource(source); } catch {} }
+            if (record.type === 'response') {
+              for (const step of record.message.server_tool_calls || []) for (const call of step.calls || []) {
+                for (const source of call.sources || []) addSource(source);
+                addSource(call.page);
+              }
+              if (sources.length) { output.entry.sources = [...sources]; output.sourceList.refresh(); }
+            }
           },
           onUsage:(reported,assistant,request) => {
             recordCacheUsage(targetSession,reported);
             if (signal.aborted || this.closed || this.session !== targetSession) return;
-            const requestMetadata = {...metadata,includeReasoning:request?.includeReasoning ?? includeReasoning};
+            const requestMetadata = {...metadata,includeReasoning:request?.includeReasoning ?? includeReasoning,...(!request?.auxiliary && Number.isSafeInteger(request?.schemaTokens) ? {schemaTokens:request.schemaTokens,schemaHash:request.schemaHash} : {})};
             if (!request?.auxiliary) this.activeRequestMetadata = requestMetadata;
-            if (!request?.auxiliary) rememberUsage(targetSession,reported,requestMetadata);
-            if (!request?.auxiliary && !requestMetadata.includeReasoning && assistant?.reasoning_content && Number.isFinite(reported?.prompt_tokens) && !Number.isFinite(reported?.completion_tokens_details?.reasoning_tokens)) targetSession.meter = {tokens:reported.prompt_tokens+estimateText(assistant.content)+8,count:targetSession.messages.length,estimated:true,...requestMetadata};
+            if (!request?.auxiliary) rememberUsage(targetSession,reported,{...requestMetadata,...(request?.aggregateUsage ? {aggregateUsage:true} : {})});
+            if (!request?.auxiliary && !request?.aggregateUsage && !requestMetadata.includeReasoning && assistant?.reasoning_content && Number.isFinite(reported?.prompt_tokens) && !Number.isFinite(reported?.completion_tokens_details?.reasoning_tokens)) targetSession.meter = {tokens:reported.prompt_tokens+estimateText(assistant.content)+8,count:targetSession.messages.length,estimated:true,...requestMetadata};
             this.refreshStats();
           },
           onText:delta => {
@@ -1620,7 +1814,7 @@ class ChatView extends ItemView {
         if (output.entry.raw !== answer) output.entry.displayText = answer;
         pacer.finish(); thinkingPacer.finish(); await this.plugin.saveSession(targetSession);
       }
-      if (!signal.aborted && pacer.pending) this.status.textContent = failure ? '连接已结束，正在显示已接收的部分内容…' : '回复已接收完毕，正在按本地显示速度继续渲染…';
+      if (!signal.aborted && pacer.pending) this.status.textContent = failure ? '连接已结束，正在显示已接收的部分内容…' : '正在完成渲染…';
       const displayError = await displaying; const thinkingError = await thinkingDisplay;
       if (signal.aborted || displayError || thinkingError) this.endFollowing(output);
       output.thinkingView.finish();
@@ -1641,7 +1835,8 @@ class ChatView extends ItemView {
       this.addNotebookResumeAction(output); this.refreshNotebookTaskStatus();
       if (failure) throw failure;
       if (!answer.trim() && !output.entry.notebookPatch) throw new Error('服务未返回文本，请重试');
-      await this.compress(key, signal, 0, model, false, capabilities, reasoningEffort, systemPrompt,turn.includeReasoning); check(signal);
+      updateRequestMetadata();
+      await this.compress(key, signal, metadata.schemaTokens, model, false, capabilities, reasoningEffort, systemPrompt,turn.includeReasoning,metadata); check(signal);
       this.status.textContent = '';
     });
   }
@@ -1649,49 +1844,39 @@ class ChatView extends ItemView {
   async uploadFiles(candidates, fromClipboard = false) {
     if (this.controller || this.clearing || this.closed) return;
     const targetSession = this.session;
-    const mineruKey = this.plugin.keys.mineru;
     await this.run(async signal => {
+      const staged = [];
       for (const candidate of candidates) {
         check(signal); if (this.closed || this.session !== targetSession) return;
         const file = fromClipboard ? await materializeClipboardAttachment(candidate) : candidate; check(signal);
-        const pdf = /\.pdf$/i.test(file.name);
-        if (!pdf && !/\.(png|jpe?g|webp|gif)$/i.test(file.name)) throw Error('请选择 PDF、PNG、JPEG、GIF 或 WebP');
-        if (!pdf) {
-          const image = await this.images.add(file,signal); check(signal);
-          if (!this.pendingImages.some(value => value.id === image.id)) this.pendingImages.push(image);
-          this.refreshPendingImages(); this.refreshStats(); this.status.textContent = '图片已暂存，发送时结合问题识别。';
-        } else {
-          if (!mineruKey) throw Error('请先填写 MinerU 密钥');
-          await this.uploadPdf(file,mineruKey,signal); check(signal);
-        }
+        if (!acceptsChatFile(file.name)) throw Error('不支持此附件格式');
+        staged.push(file);
       }
+      this.pendingFiles.push(...staged);
+      this.refreshPendingImages(); this.status.textContent = '附件已暂存，发送时上传至 DeepSeek。';
     });
   }
   async uploadPdf(file,key,signal) {
-      const output = this.row(`MinerU · ${file.name}`);
-      output.entry.modelMessages = [];
-      const fullMd = stripImageDataUris(await parseFile(file, key, signal, status => { if (!signal.aborted && !this.closed) this.status.textContent = status; }));
-      check(signal);
-      const md = await this.selectTextRange(fullMd, file.name, signal); check(signal);
-      this.update(output, md); await abortableTask(this.render(output),signal); check(signal);
-      const contextText = `Extracted text from uploaded file ${JSON.stringify(file.name)} for later questions, as reference data:\n\n${md}`;
-      const message = { role: 'user', content: contextText };
-      this.messages.push(message); output.entry.modelMessages.push(copyMessage(message)); output.entry.contextText = contextText;
-      if (this.plugin.keys.deepseek) await this.compress(this.plugin.keys.deepseek, signal);
-      check(signal); this.refreshConversationOptions(); this.status.textContent = '解析完成，可以复制 Markdown 或继续提问。';
+    const fullMd = stripImageDataUris(await parseFile(file, key, signal, status => { if (!signal.aborted && !this.closed) this.status.textContent = status; }));
+    check(signal);
+    const output = this.row(`MinerU · ${file.name}`, fullMd);
+    output.entry.modelMessages = [];
+    await abortableTask(this.render(output),signal); check(signal);
+    this.refreshConversationOptions(); this.status.textContent = '转换完成，可以保存或复制 Markdown。';
   }
+
   async clear() {
     if (this.clearing || this.closed || this.applyingNotebookPatch || this.conversationTransition) return;
     this.clearing = true; this.hideMentions();
     this.controller?.abort(); this.controller = null;
     this.activeTurn = null; this.activeRequestMetadata = null;
-    for (const button of [this.sendButton, this.uploadButton, this.compressButton, this.conversationSelect, this.newConversationButton, this.renameConversationButton, this.notebookAttach, this.clearButton]) button.disabled = true;
-    for (const button of this.feed.querySelectorAll('.sd-notebook-apply')) button.disabled = true;
+    for (const button of [this.sendButton, this.uploadButton, this.conversionButton, this.compressButton, this.conversationSelect, this.newConversationButton, this.renameConversationButton, this.notebookAttach, this.clearButton]) button.disabled = true;
+    for (const button of this.feed.querySelectorAll('.sd-notebook-apply,.sd-delete-turn')) button.disabled = true;
     try {
       const moved = await this.plugin.trashActiveConversation();
       this.resetImages();
       this.notebookTaskBuffers.clear(); this.resumeNotebookTaskId = null; this.activeNotebookEdit = null;
-      this.plugin.removeActiveConversation(); this.session = this.plugin.session; this.messages = this.session.messages;
+      await this.plugin.removeActiveConversation(); this.session = this.plugin.session; this.messages = this.session.messages;
       this.notebookSnapshot = this.session.notebookSnapshot || null;
       if (!this.closed) {
         this.disposeRows(); this.feed.empty(); this.input.value = ''; this.refreshNotebookDeltaLabel(); this.refreshStats();
@@ -1713,7 +1898,7 @@ class ChatView extends ItemView {
       this.clearing = false;
       if (!this.closed) {
         this.sendButton.textContent = '发送'; this.sendButton.title = '';
-        for (const button of [this.sendButton, this.uploadButton, this.compressButton, this.effortSelect, this.conversationSelect, this.newConversationButton, this.renameConversationButton, this.notebookAttach, this.clearButton]) button.disabled = false;
+        for (const button of [this.sendButton, this.uploadButton, this.conversionButton, this.compressButton, this.effortSelect, this.conversationSelect, this.newConversationButton, this.renameConversationButton, this.notebookAttach, this.clearButton]) button.disabled = false;
         for (const button of this.feed.querySelectorAll('.sd-delete-turn')) button.disabled = false;
         this.refreshPatchActions();
         this.restoreComposerFocus(null, true);
@@ -1721,6 +1906,7 @@ class ChatView extends ItemView {
     }
   }
   async onClose() {
+    this.speech?.dispose();
     this.hideMentions(); const shutdown = this.disconnectNotebook(); this.closed = true; this.conversationTransition = null; this.confirmationFinish?.();
     this.notebookPreview?.removeEventListener('toggle',this.notebookPreviewToggleListener); this.notebookPreviewToggleListener = null;
     const doc = this.input?.ownerDocument;
@@ -1740,10 +1926,11 @@ module.exports = class SimpleDeepSeek extends Plugin {
     this.modelCatalog = new ModelCatalog({ fetchModels: listModels });
     this.conversations = []; this.activeConversationId = ''; this.conversationNames = {};
     this.displayTokensPerSecond = 0; this.model = 'deepseek-flash'; this.reasoningEffort = 'low'; this.webEnabled = true; this.uiLanguage = 'en'; this.libraryPath = DEFAULT_LIBRARY; this.notebookPath = ''; this.jupyterUrl = ''; this.jupyterToken = ''; this.jupyterRoot = ''; this.jupyterExecutablePath = ''; this.notebookFilePath = '';
-    this.keys = { deepseek: '', mineru: '' }; this.saveQueue = Promise.resolve(); this.sessionTimers = new Map(); this.authPageOpenedAt = new Map(); this.retiredConversationIds = new Set(); this.persistedConversationIds = new Set();
+    this.keys = { deepseek: '', mineru: '' }; this.saveQueue = Promise.resolve(); this.sessionTimers = new Map(); this.pendingSessionSaves = new Map(); this.failedSessionSaves = new Set(); this.conversationIndex = {}; this.savedSharedText = ''; this.authPageOpenedAt = new Map(); this.retiredConversationIds = new Set(); this.persistedConversationIds = new Set();
     let saved = null, requestedActive = '';
     try {
       saved = await this.loadData();
+      this.savedSharedText = JSON.stringify(saved) || '';
       if (typeof saved?.activeConversationId === 'string') requestedActive = saved.activeConversationId;
       if (typeof saved?.model === 'string' && saved.model.trim()) this.model = saved.model.trim();
       if (saved?.conversationNames && typeof saved.conversationNames === 'object' && !Array.isArray(saved.conversationNames)) {
@@ -1752,17 +1939,20 @@ module.exports = class SimpleDeepSeek extends Plugin {
       if (['en', 'zh'].includes(saved?.uiLanguage)) this.uiLanguage = saved.uiLanguage;
       if (['low','high','max'].includes(saved?.reasoningEffort)) this.reasoningEffort = saved.reasoningEffort;
       if (typeof saved?.webEnabled === 'boolean') this.webEnabled = saved.webEnabled;
-      if (saved?.displayTokensPerSecond === 0 || (Number.isInteger(saved?.displayTokensPerSecond) && saved.displayTokensPerSecond >= 20 && saved.displayTokensPerSecond <= 300)) this.displayTokensPerSecond = saved.displayTokensPerSecond;
+
     } catch { this.notice('无法读取共享设置，请检查插件配置文件。'); }
     try {
       this.conversationStore = createConversationStore(this.app, this.manifest);
-      const loaded = await this.conversationStore.load();
+      const indexed = typeof this.conversationStore.list === 'function';
+      const loaded = indexed ? await this.conversationStore.list(saved?.conversationIndex) : await this.conversationStore.load();
+      this.conversationIndex = loaded.index || {};
+      const firstId = loaded.items.some(item => item.id === requestedActive) ? requestedActive : loaded.items[0]?.id;
       for (const item of loaded.items) {
-        const session = restoreSession(item.session);
-        if (session && !this.conversations.some(other => other.id === item.id)) {
-          this.conversations.push({ id: item.id, createdAt: item.createdAt, session });
+        const session = item.session && (!indexed || item.id === firstId) ? restoreSession(item.session) : null;
+        if ((session || indexed) && !this.conversations.some(other => other.id === item.id)) {
+          this.conversations.push({ id: item.id, createdAt: item.createdAt, session, title:item.title || (session ? sessionTitle(session) : '') });
           this.persistedConversationIds.add(item.id);
-          if (item.name && !this.conversationNames[item.id]) this.conversationNames[item.id] = item.name;
+          if (Object.prototype.hasOwnProperty.call(item,'name')) { if (item.name) this.conversationNames[item.id] = item.name; else delete this.conversationNames[item.id]; }
         }
       }
       if (loaded.errors.length) this.notice(`${loaded.errors.length} 个对话文件无法读取，其他对话已正常载入。`);
@@ -1775,7 +1965,12 @@ module.exports = class SimpleDeepSeek extends Plugin {
       this.keyStorageMessage = '密钥、路径和 Jupyter 连接信息按当前系统用户加密保存，不写入笔记库配置。';
     } catch { this.keyStore = null; this.notice(this.keyStorageMessage); }
     if (!this.conversations.length) this.addConversation();
-    else { this.activeConversationId = this.conversations.some(item => item.id === requestedActive) ? requestedActive : this.conversations[0].id; this.session = this.conversations.find(item => item.id === this.activeConversationId).session; }
+    else {
+      const id = this.conversations.some(item => item.id === requestedActive) ? requestedActive : this.conversations[0].id;
+      try { await this.ensureConversation(id); this.activateConversation(id); }
+      catch { this.notice('对话读取失败，原文件已保留。'); this.session = null; this.addConversation(); }
+    }
+    if (this.conversationStore?.list) { try { await this.persistShared(this.sharedSnapshot()); } catch { this.notice('共享设置保存失败，请检查插件目录是否可写。'); } }
     this.registerView(VIEW, leaf => new ChatView(leaf, this));
     const open = async () => {
       try {
@@ -1793,14 +1988,29 @@ module.exports = class SimpleDeepSeek extends Plugin {
     return item;
   }
   activateConversation(id) {
-    const item = this.conversations.find(candidate => candidate.id === id); if (!item) return false;
+    const item = this.conversations.find(candidate => candidate.id === id); if (!item?.session) return false;
     this.activeConversationId = item.id; this.session = item.session; return true;
   }
-  removeActiveConversation() {
+  async ensureConversation(id) {
+    const item = this.conversations.find(candidate => candidate.id === id);
+    if (!item) throw Error('对话不存在');
+    if (item.session) return item;
+    if (!item.loading) item.loading = (async () => {
+      const record = await this.conversationStore.loadOne(id), session = restoreSession(record.session);
+      if (!session) throw Error('对话格式无效');
+      item.session = session; item.createdAt = record.createdAt; item.title = sessionTitle(session);
+      if (Object.prototype.hasOwnProperty.call(record,'name')) { if (record.name) this.conversationNames[id] = record.name; else delete this.conversationNames[id]; }
+      this.updateConversationIndex(id); return item;
+    })().finally(() => { delete item.loading; });
+    return item.loading;
+  }
+  async removeActiveConversation() {
     const index = this.conversations.findIndex(item => item.id === this.activeConversationId);
-    if (index >= 0) { const {id,session} = this.conversations[index]; this.cancelSessionSave(session); this.retiredConversationIds.add(id); delete this.conversationNames[id]; this.conversations.splice(index, 1); }
+    if (index >= 0) { const {id,session} = this.conversations[index]; this.cancelSessionSave(session); this.failedSessionSaves.delete(session); this.retiredConversationIds.add(id); delete this.conversationNames[id]; delete this.conversationIndex[id]; this.conversations.splice(index, 1); }
     if (!this.conversations.length) this.addConversation();
-    const next = this.conversations[Math.min(Math.max(index, 0), this.conversations.length - 1)]; this.activeConversationId = next.id; this.session = next.session;
+    const next = this.conversations[Math.min(Math.max(index, 0), this.conversations.length - 1)];
+    try { await this.ensureConversation(next.id); this.activateConversation(next.id); }
+    catch { this.notice('对话读取失败，原文件已保留。'); this.session = null; this.addConversation(); }
   }
   openExpiredKeyPage(error) {
     const page = error?.authExpired && API_MANAGE_PAGES[error.authService];
@@ -1832,8 +2042,38 @@ module.exports = class SimpleDeepSeek extends Plugin {
     if (timer !== undefined) { clearTimeout(timer); this.sessionTimers.delete(session); }
   }
   conversationRecord(current) {
-    return current && (current.session.messages.length || current.session.entries.length || this.conversationNames[current.id] || this.persistedConversationIds.has(current.id))
-      ? { id: current.id, createdAt: current.createdAt, session: JSON.parse(JSON.stringify(current.session)), ...(this.conversationNames[current.id] ? { name: this.conversationNames[current.id] } : {}) } : null;
+    return current?.session && (current.session.messages.length || current.session.entries.length || this.conversationNames[current.id] || this.persistedConversationIds.has(current.id))
+      ? prepareConversationRecord({ id: current.id, createdAt: current.createdAt, session: current.session, ...(this.conversationNames[current.id] ? { name: this.conversationNames[current.id] } : {}) }) : null;
+  }
+  updateConversationIndex(id) {
+    const metadata = this.conversationStore?.metadata?.(id);
+    if (metadata) this.conversationIndex[id] = metadata;
+  }
+  async persistShared(snapshot) {
+    const serialized = JSON.stringify(snapshot);
+    if (serialized === this.savedSharedText) return;
+    await this.saveData(snapshot); this.savedSharedText = serialized;
+  }
+  async writeConversation(current, record) {
+    if (!record || !current || this.retiredConversationIds.has(current.id)) return;
+    const retarget = (prepared,id,createdAt,name) => prepareConversationRecord({...JSON.parse(prepared.body),id,createdAt,...(name ? {name} : {name:undefined})});
+    if (record.id !== current.id) record = retarget(record,current.id,current.createdAt,this.conversationNames[current.id]);
+    try { await this.conversationStore.save(record); }
+    catch (error) {
+      if (error.code !== 'CONVERSATION_CONFLICT') throw error;
+      const originalId = current.id, originalCreatedAt = current.createdAt, originalTitle = current.title || record.title;
+      const id = conversationId(), createdAt = Date.now();
+      const name = (this.conversationNames[originalId] || record.title) + ' · ' + translate('本地副本',this.uiLanguage);
+      await this.conversationStore.save(retarget(record,id,createdAt,name));
+      current.id = id; current.createdAt = createdAt; this.conversationNames[id] = name;
+      if (error.reason === 'deleted') { delete this.conversationIndex[originalId]; delete this.conversationNames[originalId]; this.persistedConversationIds.delete(originalId); }
+      else this.conversations.push({id:originalId,createdAt:originalCreatedAt,title:originalTitle,session:null});
+      if (this.activeConversationId === originalId) this.activeConversationId = id;
+      this.notice(error.reason === 'deleted' ? '检测到会话文件在外部删除，当前内容已另存为本地副本。' : '检测到外部修改，当前对话已另存为本地副本，外部版本保留。');
+      for (const leaf of this.app?.workspace?.getLeavesOfType?.(VIEW) || []) if (!leaf.view.closed) leaf.view.refreshConversationOptions?.();
+    }
+    this.persistedConversationIds.add(current.id); current.title = record.title;
+    this.updateConversationIndex(current.id);
   }
   async trashActiveConversation() {
     const current = this.conversations.find(item => item.id === this.activeConversationId), record = this.conversationRecord(current);
@@ -1842,7 +2082,7 @@ module.exports = class SimpleDeepSeek extends Plugin {
     let moved = false;
     const operation = this.saveQueue.catch(() => {}).then(async () => {
       if (!this.conversationStore) throw Error('对话目录不可用');
-      if (record) await this.conversationStore.save(record);
+      if (record) await this.writeConversation(current,record);
       moved = await this.conversationStore.remove(current.id);
       this.retiredConversationIds.add(current.id);
     });
@@ -1853,36 +2093,51 @@ module.exports = class SimpleDeepSeek extends Plugin {
   async saveSession(session = this.session, strict = false) {
     this.cancelSessionSave(session);
     const current = this.conversations.find(item => item.session === session);
-    const record = this.conversationRecord(current), snapshot = this.sharedSnapshot();
-    this.saveQueue = this.saveQueue.catch(() => {}).then(async () => {
-      if (!this.conversationStore) throw Error('对话目录不可用');
-      if (record && !this.retiredConversationIds.has(record.id)) { await this.conversationStore.save(record); this.persistedConversationIds.add(record.id); }
-      await this.saveData(snapshot);
-    });
-    try { await this.saveQueue; }
-    catch { this.notice('当前对话保存失败，请检查插件目录是否可写。'); if (strict) throw Error('Notebook 暂存任务保存失败，已停止继续生成'); }
+    try {
+      let job = this.pendingSessionSaves.get(session);
+      if (!strict && job && !job.started && !job.strict) { await job.promise; return; }
+      // A strict checkpoint freezes any earlier pending save of this session.
+      if (strict && job && !job.started && !job.captured) { job.record = this.conversationRecord(current); job.captured = true; }
+      job = {strict,started:false,captured:strict,record:strict ? this.conversationRecord(current) : null};
+      job.promise = this.saveQueue.catch(() => {}).then(async () => {
+        job.started = true;
+        if (this.pendingSessionSaves.get(session) === job) this.pendingSessionSaves.delete(session);
+        if (!this.conversationStore) throw Error('对话目录不可用');
+        const owner = this.conversations.find(item => item.session === session);
+        if (!job.captured) job.record = this.conversationRecord(owner);
+        await this.writeConversation(owner,job.record);
+        await this.persistShared(this.sharedSnapshot());
+        this.failedSessionSaves.delete(session);
+      });
+      this.pendingSessionSaves.set(session,job); this.saveQueue = job.promise;
+      await job.promise;
+    } catch (error) {
+      if (current && !this.retiredConversationIds.has(current.id)) this.failedSessionSaves.add(session);
+      this.notice(error.code === 'CONVERSATION_TOO_LARGE' ? '对话记录超过本地存档大小上限，原文件已保留。' : '当前对话保存失败，请检查插件目录是否可写。');
+      if (strict) throw Error('Notebook 暂存任务保存失败，已停止继续生成');
+    }
   }
   sharedSnapshot() {
-    const snapshot = { model: this.model, displayTokensPerSecond: this.displayTokensPerSecond, reasoningEffort: this.reasoningEffort, webEnabled:this.webEnabled, uiLanguage: this.uiLanguage };
+    const snapshot = { model: this.model, reasoningEffort: this.reasoningEffort, webEnabled:this.webEnabled, uiLanguage: this.uiLanguage };
     if (Object.keys(this.conversationNames).length) snapshot.conversationNames = { ...this.conversationNames };
-    if (this.conversations.some(item => item.id === this.activeConversationId && (item.session.messages.length || item.session.entries.length || this.conversationNames[item.id] || this.persistedConversationIds.has(item.id)))) snapshot.activeConversationId = this.activeConversationId;
+    if (Object.keys(this.conversationIndex).length) snapshot.conversationIndex = {...this.conversationIndex};
+    if (this.conversations.some(item => item.id === this.activeConversationId && (item.session?.messages.length || item.session?.entries.length || this.conversationNames[item.id] || this.persistedConversationIds.has(item.id)))) snapshot.activeConversationId = this.activeConversationId;
     return snapshot;
   }
   saveKeys(requireSecure = true) {
     const keys = { deepseek: this.keys.deepseek, mineru: this.keys.mineru, libraryPath: this.libraryPath, notebookPath: this.notebookPath, jupyterUrl: this.jupyterUrl, jupyterToken: this.jupyterToken, jupyterRoot: this.jupyterRoot, jupyterExecutablePath: this.jupyterExecutablePath, notebookFilePath: this.notebookFilePath };
-    const snapshot = this.sharedSnapshot();
     this.saveQueue = this.saveQueue.catch(() => {}).then(async () => {
       let keyError;
       if (this.keyStore) { try { await this.keyStore.save(keys); } catch { keyError = new Error('密钥安全保存失败，已输入密钥仅在本次运行可用。'); } }
       else if (keys.deepseek || keys.mineru || keys.libraryPath || keys.notebookPath || keys.jupyterUrl || keys.jupyterToken || keys.jupyterExecutablePath || keys.notebookFilePath) keyError = new Error('系统安全存储不可用，密钥、路径和 Jupyter 连接信息仅在本次运行可用。');
-      await this.saveData(snapshot);
+      await this.persistShared(this.sharedSnapshot());
       if (keyError && requireSecure) { this.notice(keyError.message); throw keyError; }
     });
     return this.saveQueue;
   }
   onunload() {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW)) { leaf.view.controller?.abort(); leaf.view.resetImages?.(); leaf.view.disposeRows?.();  }
-    for (const session of new Set([...this.sessionTimers.keys(),this.session])) void this.saveSession(session);
+    for (const session of new Set([...this.sessionTimers.keys(),...this.failedSessionSaves,this.session])) void this.saveSession(session);
     this.app.workspace.detachLeavesOfType(VIEW);
     // Keep the final snapshot available while asynchronous view-close saves finish.
   }
